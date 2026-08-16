@@ -1,0 +1,105 @@
+# AGENTS.md — CherryPi Project Notes
+
+## Logs
+
+Logs are written in JSONL format to the platform data directory:
+
+| Platform | Path |
+|---|---|
+| Linux | `~/.local/share/cherrypi/logs/` |
+| macOS | `~/Library/Application Support/cherrypi/logs/` |
+| Windows | `%APPDATA%/cherrypi/logs/` |
+
+### Log files
+
+- **`chat.jsonl`** — Full chat transcript. One JSON record per line: `{"timestamp","cwd","role","content"}`. Roles: `user`, `assistant`, `system`, `error`.
+- **`cherrypi.jsonl`** — Structured application logs (tracing). Rotates at 25MB, keeps 7 compressed `.gz` archives.
+
+### Viewing logs
+
+```bash
+# Tail the chat transcript
+cat ~/.local/share/cherrypi/logs/chat.jsonl | jq .
+
+# Filter errors only
+grep '"role":"error"' ~/.local/share/cherrypi/logs/chat.jsonl | jq .
+
+# Tail app logs
+cat ~/.local/share/cherrypi/logs/cherrypi.jsonl | jq .
+
+# Filter ERROR level only
+grep '"ERROR"' ~/.local/share/cherrypi/logs/cherrypi.jsonl | jq .
+```
+
+## Config
+
+Config file: `~/.config/cherrypi/config.json` (Linux). Created with defaults on first run if missing.
+
+## Build
+
+```bash
+cargo build
+cargo run
+```
+
+## Status Bar Plugins
+
+Plugins can contribute segments to the TUI status bar by declaring a `status_bar`
+in their manifest. The command is polled on a configurable interval and its stdout
+is rendered in the bottom bar.
+
+### Manifest format
+
+```json
+{
+  "name": "my-status-plugin",
+  "status_bar": {
+    "command": "scripts/status.sh",
+    "refresh_ms": 3000,
+    "label": "git"
+  }
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `command` | Yes | Shell command (supports `${PLUGIN_ROOT}` variable) |
+| `refresh_ms` | No | Poll interval in ms (default: 2000) |
+| `label` | No | Prefix shown before the output in the status bar |
+| `stdin_context` | No | If true, pipe `{model, workspace, session_id}` JSON to stdin |
+
+When `stdin_context: true`, the command receives a JSON object on stdin:
+
+```json
+{
+  "model": {"display_name": "llama3.2"},
+  "workspace": {"current_dir": "/home/user/project"},
+  "session_id": "uuid-..."
+}
+```
+
+This is compatible with [ferrisbar](https://github.com/kerryhatcher/ferrisbar) —
+a Rust statusline renderer that reads this exact format. `cargo install ferrisbar`
+and add a plugin manifest pointing to it:
+
+```json
+{
+  "name": "ferrisbar",
+  "status_bar": {
+    "command": "ferrisbar",
+    "stdin_context": true,
+    "label": null
+  }
+}
+```
+
+### Example plugin
+
+See `plugins/demo-status/` for a working example that shows git branch and
+system load in the status bar.
+
+### Plugin search paths
+
+- `./plugins/` (project-local)
+- `~/.local/share/cherrypi/plugins/` (installed)
+- Custom paths via `--plugin-dir` CLI flag or config

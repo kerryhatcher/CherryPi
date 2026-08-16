@@ -1,0 +1,12 @@
+{
+  "name": "ferrisbar",
+  "version": "0.2.0",
+  "description": "A statusline renderer, written in Rust",
+  "author": { "name": "Kerry Hatcher" },
+  "repository": "https://github.com/kerryhatcher/ferrisbar",
+  "status_bar": {
+    "command": "ferrisbar",
+    "refresh_ms": 2000,
+    "stdin_context": true
+  }
+}

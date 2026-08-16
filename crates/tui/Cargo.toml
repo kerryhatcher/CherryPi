@@ -1,0 +1,21 @@
+[package]
+name = "cherrypi-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cherrypi-core = { path = "../core" }
+cherrypi-agent = { path = "../agent" }
+cherrypi-llm = { path = "../llm" }
+cherrypi-plugins = { path = "../plugins" }
+ratatui.workspace = true
+crossterm.workspace = true
+tui-textarea.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+arboard = "3"

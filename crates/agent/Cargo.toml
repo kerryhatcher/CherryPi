@@ -1,0 +1,22 @@
+[package]
+name = "cherrypi-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cherrypi-core = { path = "../core" }
+cherrypi-llm = { path = "../llm" }
+cherrypi-plugins = { path = "../plugins" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait = "0.1"
+dirs.workspace = true
+fff-search.workspace = true
+git2 = "0.20"

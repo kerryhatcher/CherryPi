@@ -1,0 +1,855 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use cherrypi_core::tool::{Tool, ToolHandler, ToolRegistry, ToolResult};
+use fff_search::{FilePicker, FilePickerOptions, FFFMode, SharedFilePicker, SharedFrecency};
+use tracing::{info, warn};
+
+/// Initialise the FFF file-search index for `working_dir`.
+///
+/// Returns `(None, None)` if the working directory cannot be indexed (missing,
+/// fs root, home dir guard) so the caller can fall back to subprocess tools.
+pub fn init_fff(working_dir: &PathBuf) -> (Option<SharedFilePicker>, Option<SharedFrecency>) {
+    let base_path = match working_dir.to_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            warn!("FFF: working_dir has no UTF-8 string form; skipping init");
+            return (None, None);
+        }
+    };
+
+    let picker = SharedFilePicker::default();
+    let frecency = SharedFrecency::default();
+
+    match FilePicker::new_with_shared_state(
+        picker.clone(),
+        frecency.clone(),
+        FilePickerOptions {
+            base_path,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
+            watch: true,
+            mode: FFFMode::Ai,
+            ..Default::default()
+        },
+    ) {
+        Ok(()) => {
+            // Block briefly for the initial scan so the first agent query sees
+            // real data instead of an empty index. Cap at 10s; the watcher
+            // keeps the index warm thereafter.
+            let ready = picker.wait_for_scan(Duration::from_secs(10));
+            if !ready {
+                warn!("FFF: initial scan did not complete within 10s; index may be partial");
+            }
+            info!("FFF file-search index initialised for {:?}", working_dir);
+            (Some(picker), Some(frecency))
+        }
+        Err(e) => {
+            warn!("FFF: failed to init picker for {:?}: {}", working_dir, e);
+            (None, None)
+        }
+    }
+}
+
+/// Creates and registers all built-in tools
+pub struct BuiltinTools;
+
+impl BuiltinTools {
+    /// Register all built-in tools into the registry.
+    ///
+    /// When `fff_picker` is `Some`, the FFF-backed `grep`, `find`, and
+    /// `multi_grep` tools are registered (long-lived index, fuzzy fallback,
+    /// git-aware, paginated). When `None`, the subprocess `grep`/`find`
+    /// fallbacks are registered so the agent always has working search.
+    ///
+    /// `extra_bin_paths` — additional directories to prepend to `$PATH`
+    /// when executing bash commands (e.g. CherryPi's private cargo bin dir).
+    pub fn register_all(
+        registry: &mut ToolRegistry,
+        working_dir: PathBuf,
+        fff_picker: Option<SharedFilePicker>,
+        cancel_flag: Arc<AtomicBool>,
+        extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
+    ) {
+        registry.register(Arc::new(ReadFileTool::new(working_dir.clone())));
+        registry.register(Arc::new(WriteFileTool::new(working_dir.clone())));
+        registry.register(Arc::new(EditFileTool::new(working_dir.clone())));
+        registry.register(Arc::new(BashTool::new(
+            working_dir.clone(),
+            extra_bin_paths,
+        )));
+        registry.register(Arc::new(ListDirTool::new(working_dir.clone())));
+        registry.register(Arc::new(WebSearchTool));
+        registry.register(Arc::new(WebFetchTool));
+
+        match fff_picker {
+            Some(picker) => {
+                use crate::fff_tools::{FffFindTool, FffGrepTool, FffMultiGrepTool};
+                registry.register(Arc::new(FffFindTool::new(
+                    picker.clone(),
+                    working_dir.clone(),
+                )));
+                registry.register(Arc::new(FffGrepTool::new(
+                    picker.clone(),
+                    working_dir.clone(),
+                    cancel_flag,
+                )));
+                registry.register(Arc::new(FffMultiGrepTool::new(
+                    picker.clone(),
+                    working_dir.clone(),
+                )));
+            }
+            None => {
+                info!("FFF picker unavailable; registering subprocess grep/find fallbacks");
+                registry.register(Arc::new(GrepTool::new(working_dir.clone())));
+                registry.register(Arc::new(FindTool::new(working_dir.clone())));
+            }
+        }
+    }
+}
+
+// --- Read File Tool ---
+
+struct ReadFileTool {
+    working_dir: PathBuf,
+}
+
+impl ReadFileTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadFileTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "read".into(),
+            description: "Read the contents of a file. Supports text files and images.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative or absolute)"
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Line number to start reading from (1-indexed)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to read"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let path = arguments["path"].as_str().unwrap_or("");
+        let offset = arguments["offset"].as_u64().map(|o| o as usize).unwrap_or(1);
+        let limit = arguments["limit"].as_u64().map(|l| l as usize);
+
+        let full_path = resolve_path(&self.working_dir, path);
+
+        match std::fs::read_to_string(&full_path) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = (offset - 1).min(lines.len());
+                let end = limit.map(|l| (start + l).min(lines.len())).unwrap_or(lines.len());
+                let output = lines[start..end].join("\n");
+
+                ToolResult {
+                    tool_call_id: String::new(),
+                    content: output,
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error reading file: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Write File Tool ---
+
+struct WriteFileTool {
+    working_dir: PathBuf,
+}
+
+impl WriteFileTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for WriteFileTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "write".into(),
+            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to write (relative or absolute)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let path = arguments["path"].as_str().unwrap_or("");
+        let content = arguments["content"].as_str().unwrap_or("");
+
+        let full_path = resolve_path(&self.working_dir, path);
+
+        // Create parent directories if needed
+        if let Some(parent) = full_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ToolResult {
+                    tool_call_id: String::new(),
+                    content: format!("Error creating directories: {}", e),
+                    is_error: true,
+                };
+            }
+        }
+
+        match std::fs::write(&full_path, content) {
+            Ok(_) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Successfully wrote {} bytes to {}", content.len(), path),
+                is_error: false,
+            },
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error writing file: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Edit File Tool ---
+
+struct EditFileTool {
+    working_dir: PathBuf,
+}
+
+impl EditFileTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for EditFileTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "edit".into(),
+            description: "Edit a file using exact text replacement. Each edit's oldText must match exactly.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to edit"
+                    },
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "oldText": {
+                                    "type": "string",
+                                    "description": "Exact text to replace"
+                                },
+                                "newText": {
+                                    "type": "string",
+                                    "description": "Replacement text"
+                                }
+                            },
+                            "required": ["oldText", "newText"]
+                        },
+                        "description": "One or more targeted replacements"
+                    }
+                },
+                "required": ["path", "edits"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let path = arguments["path"].as_str().unwrap_or("");
+        let full_path = resolve_path(&self.working_dir, path);
+
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    tool_call_id: String::new(),
+                    content: format!("Error reading file: {}", e),
+                    is_error: true,
+                };
+            }
+        };
+
+        let edits = match arguments["edits"].as_array() {
+            Some(e) => e,
+            None => {
+                return ToolResult {
+                    tool_call_id: String::new(),
+                    content: "No edits provided".into(),
+                    is_error: true,
+                };
+            }
+        };
+
+        let mut new_content = content.clone();
+        let mut applied = 0;
+
+        for edit in edits {
+            let old_text = edit["oldText"].as_str().unwrap_or("");
+            let new_text = edit["newText"].as_str().unwrap_or("");
+
+            if let Some(pos) = new_content.find(old_text) {
+                // Check uniqueness
+                if new_content[pos + old_text.len()..].contains(old_text) {
+                    return ToolResult {
+                        tool_call_id: String::new(),
+                        content: format!(
+                            "oldText '{}' is not unique in the file. Provide more context.",
+                            &old_text[..old_text.len().min(50)]
+                        ),
+                        is_error: true,
+                    };
+                }
+                new_content.replace_range(pos..pos + old_text.len(), new_text);
+                applied += 1;
+            } else {
+                return ToolResult {
+                    tool_call_id: String::new(),
+                    content: format!(
+                        "oldText '{}' not found in file",
+                        &old_text[..old_text.len().min(50)]
+                    ),
+                    is_error: true,
+                };
+            }
+        }
+
+        match std::fs::write(&full_path, &new_content) {
+            Ok(_) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Successfully applied {} edit(s) to {}", applied, path),
+                is_error: false,
+            },
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error writing file: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Bash Tool ---
+
+struct BashTool {
+    working_dir: PathBuf,
+    /// Additional directories to prepend to PATH (e.g. CherryPi's private
+    /// cargo bin directory where plugin-installed binaries live).
+    extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
+}
+
+impl BashTool {
+    fn new(working_dir: PathBuf, extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>) -> Self {
+        Self {
+            working_dir,
+            extra_bin_paths,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for BashTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "bash".into(),
+            description: "Execute a bash command. Returns stdout and stderr.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Bash command to execute"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (optional)"
+                    }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let command = arguments["command"].as_str().unwrap_or("");
+        let _timeout = arguments["timeout"].as_u64().unwrap_or(30);
+
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&self.working_dir);
+
+        // Prepend extra binary directories to PATH so plugin-installed
+        // binaries (e.g. gor from the private cargo bin dir) are found.
+        if let Some(ref extra_dirs) = self.extra_bin_paths {
+            let dirs = extra_dirs.lock().unwrap();
+            if !dirs.is_empty() {
+                let current = std::env::var("PATH").unwrap_or_default();
+                let extra: Vec<String> = dirs.iter().map(|d| d.to_string_lossy().to_string()).collect();
+                let mut new_path = extra.join(":");
+                if !current.is_empty() {
+                    new_path.push(':');
+                    new_path.push_str(&current);
+                }
+                cmd.env("PATH", &new_path);
+            }
+        }
+
+        let output = cmd.output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut result = String::new();
+
+                if !stdout.is_empty() {
+                    result.push_str(&stdout);
+                }
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str("STDERR:\n");
+                    result.push_str(&stderr);
+                }
+                if result.is_empty() {
+                    result = format!("Command completed with exit code: {}", out.status.code().unwrap_or(-1));
+                }
+
+                ToolResult {
+                    tool_call_id: String::new(),
+                    content: result,
+                    is_error: !out.status.success(),
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error executing command: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Grep Tool ---
+
+struct GrepTool {
+    working_dir: PathBuf,
+}
+
+impl GrepTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for GrepTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "grep".into(),
+            description: "Search file contents using ripgrep. Returns matching lines with file paths.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern (literal or regex)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search (default: current directory)"
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "File glob filter, e.g. *.rs"
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case-insensitive search"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let pattern = arguments["pattern"].as_str().unwrap_or("");
+        let search_path = arguments["path"].as_str().unwrap_or(".");
+        let glob = arguments["glob"].as_str();
+        let ignore_case = arguments["ignore_case"].as_bool().unwrap_or(false);
+
+        let full_path = resolve_path(&self.working_dir, search_path);
+
+        let mut cmd = std::process::Command::new("rg");
+        cmd.arg("--line-number");
+        cmd.arg("--color=never");
+
+        if ignore_case {
+            cmd.arg("--ignore-case");
+        }
+
+        if let Some(g) = glob {
+            cmd.arg("--glob").arg(g);
+        }
+
+        cmd.arg(pattern);
+        cmd.arg(&full_path);
+
+        match cmd.output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let result = if stdout.is_empty() {
+                    "No matches found.".to_string()
+                } else {
+                    // Truncate to reasonable size
+                    let lines: Vec<&str> = stdout.lines().take(200).collect();
+                    lines.join("\n")
+                };
+
+                ToolResult {
+                    tool_call_id: String::new(),
+                    content: result,
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error searching: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Find Tool ---
+
+struct FindTool {
+    working_dir: PathBuf,
+}
+
+impl FindTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for FindTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "find".into(),
+            description: "Find files by name or glob pattern.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "File name or glob pattern to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search (default: current directory)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let pattern = arguments["pattern"].as_str().unwrap_or("*");
+        let search_path = arguments["path"].as_str().unwrap_or(".");
+
+        let full_path = resolve_path(&self.working_dir, search_path);
+
+        let output = std::process::Command::new("find")
+            .arg(&full_path)
+            .arg("-name")
+            .arg(pattern)
+            .arg("-type")
+            .arg("f")
+            .arg("-maxdepth")
+            .arg("50")
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let result = if stdout.is_empty() {
+                    "No files found.".to_string()
+                } else {
+                    let lines: Vec<&str> = stdout.lines().take(100).collect();
+                    lines.join("\n")
+                };
+
+                ToolResult {
+                    tool_call_id: String::new(),
+                    content: result,
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error finding files: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- List Directory Tool ---
+
+struct ListDirTool {
+    working_dir: PathBuf,
+}
+
+impl ListDirTool {
+    fn new(working_dir: PathBuf) -> Self {
+        Self { working_dir }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListDirTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "ls".into(),
+            description: "List directory contents.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to list (default: current directory)"
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Include hidden files"
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let path = arguments["path"].as_str().unwrap_or(".");
+        let all = arguments["all"].as_bool().unwrap_or(false);
+
+        let full_path = resolve_path(&self.working_dir, path);
+
+        let mut cmd = std::process::Command::new("ls");
+        cmd.arg("-la");
+        if all {
+            cmd.arg("-a");
+        }
+        cmd.arg(&full_path);
+
+        match cmd.output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                ToolResult {
+                    tool_call_id: String::new(),
+                    content: stdout.to_string(),
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Error listing directory: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Web Search Tool ---
+
+struct WebSearchTool;
+
+#[async_trait]
+impl ToolHandler for WebSearchTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "web_search".into(),
+            description: "Search the web using a local Ollama web search instance.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Maximum number of results (default: 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let query = arguments["query"].as_str().unwrap_or("");
+        let max_results = arguments["max_results"].as_u64().unwrap_or(5);
+
+        // Use curl to call Ollama's web search API
+        let output = std::process::Command::new("curl")
+            .arg("-s")
+            .arg(format!(
+                "http://localhost:11434/api/web_search?query={}&max_results={}",
+                urlencoding(query),
+                max_results
+            ))
+            .output();
+
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    ToolResult {
+                        tool_call_id: String::new(),
+                        content: stdout.to_string(),
+                        is_error: false,
+                    }
+                } else {
+                    ToolResult {
+                        tool_call_id: String::new(),
+                        content: "Web search failed. Ensure Ollama is running with web search enabled.".into(),
+                        is_error: true,
+                    }
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Web search error: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Web Fetch Tool ---
+
+struct WebFetchTool;
+
+#[async_trait]
+impl ToolHandler for WebFetchTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "web_fetch".into(),
+            description: "Fetch and extract text content from a URL.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL to fetch and extract content from"
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
+        let url = arguments["url"].as_str().unwrap_or("");
+
+        let output = std::process::Command::new("curl")
+            .arg("-s")
+            .arg(format!(
+                "http://localhost:11434/api/web_fetch?url={}",
+                urlencoding(url)
+            ))
+            .output();
+
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    ToolResult {
+                        tool_call_id: String::new(),
+                        content: stdout.to_string(),
+                        is_error: false,
+                    }
+                } else {
+                    ToolResult {
+                        tool_call_id: String::new(),
+                        content: "Web fetch failed. Ensure Ollama is running with web fetch enabled.".into(),
+                        is_error: true,
+                    }
+                }
+            }
+            Err(e) => ToolResult {
+                tool_call_id: String::new(),
+                content: format!("Web fetch error: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// --- Helpers ---
+
+fn resolve_path(working_dir: &PathBuf, path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        working_dir.join(p)
+    }
+}
+
+fn urlencoding(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
+}
