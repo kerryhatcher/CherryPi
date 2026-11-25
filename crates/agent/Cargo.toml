@@ -11,6 +11,7 @@ cherrypi-plugins = { path = "../plugins" }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+encoding_rs = "0.8"
 thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
