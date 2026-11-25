@@ -30,6 +30,10 @@ pub struct PluginLoader {
     install_dir: Option<PathBuf>,
 }
 
+impl Default for PluginLoader {
+    fn default() -> Self { Self::new() }
+}
+
 impl PluginLoader {
     pub fn new() -> Self {
         let install_dir = dirs::data_dir()

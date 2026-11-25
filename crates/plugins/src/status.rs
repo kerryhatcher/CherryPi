@@ -53,6 +53,10 @@ pub struct StatusBarManager {
     entries: Vec<Entry>,
 }
 
+impl Default for StatusBarManager {
+    fn default() -> Self { Self::new() }
+}
+
 impl StatusBarManager {
     pub fn new() -> Self {
         Self {

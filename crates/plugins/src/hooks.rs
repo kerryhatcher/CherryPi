@@ -47,6 +47,10 @@ pub struct HookEngine {
     timeout: Duration,
 }
 
+impl Default for HookEngine {
+    fn default() -> Self { Self::new() }
+}
+
 impl HookEngine {
     pub fn new() -> Self {
         Self {
@@ -212,13 +216,23 @@ impl HookEngine {
                     command, stdin_context
                 );
 
-                let output = if *stdin_context {
-                    Self::run_command_with_stdin(command, ctx)
-                } else {
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .output()
+                let command = command.clone();
+                let command_for_task = command.clone();
+                let context = ctx.clone();
+                let with_stdin = *stdin_context;
+                let output = match tokio::time::timeout(
+                    self.timeout,
+                    tokio::task::spawn_blocking(move || {
+                        if with_stdin {
+                            Self::run_command_with_stdin(&command_for_task, &context)
+                        } else {
+                            Command::new("sh").arg("-c").arg(&command_for_task).output()
+                        }
+                    }),
+                ).await {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(e)) => Err(std::io::Error::other(format!("hook task failed: {e}"))),
+                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "hook command timed out")),
                 };
 
                 match output {

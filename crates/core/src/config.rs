@@ -1,7 +1,10 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 /// Global configuration for CherryPi
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Config {
     /// LLM provider configuration
     pub provider: ProviderConfig,
@@ -16,18 +19,23 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: ProviderConfig::default(),
-            agent: AgentConfig::default(),
-            plugins: PluginConfig::default(),
-            ui: UiConfig::default(),
-        }
+impl Config {
+    /// Load a config file. Files ending in `.json` are read as JSON (the legacy
+    /// format); any other file is read as TOML.
+    pub fn load_file(path: &Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let parsed = if path.extension().is_some_and(|ext| ext == "json") {
+            serde_json::from_str::<Self>(&content).map_err(|e| e.to_string())
+        } else {
+            toml::from_str::<Self>(&content).map_err(|e| e.to_string())
+        };
+        parsed.map_err(|e| format!("invalid config {}: {e}", path.display()))
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProviderConfig {
     /// Provider type: "ollama", "openai", "anthropic", "openrouter"
     pub provider_type: String,
@@ -61,7 +69,7 @@ impl Default for ProviderConfig {
             provider_type: "ollama".to_string(),
             endpoint: "http://localhost:11434".to_string(),
             api_key: None,
-            model: "llama3.2".to_string(),
+            model: "deepseek-v4-flash:cloud".to_string(),
             max_context_tokens: 8192,
             max_output_tokens: 4096,
             temperature: 0.7,
@@ -71,6 +79,7 @@ impl Default for ProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentConfig {
     /// System prompt for the agent (None = use built-in default)
     #[serde(default)]
@@ -108,6 +117,7 @@ impl Default for AgentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PluginConfig {
     /// Whether plugins are enabled
     pub enabled: bool,
@@ -125,6 +135,10 @@ pub struct PluginConfig {
 
     /// Maximum plugin execution timeout in seconds
     pub timeout_secs: u64,
+
+    /// Plugin identifiers explicitly permitted to execute commands/processes.
+    #[serde(default)]
+    pub trusted_plugins: Vec<String>,
 }
 
 impl Default for PluginConfig {
@@ -135,11 +149,13 @@ impl Default for PluginConfig {
             install_dir: None,
             install_bin_dir: None,
             timeout_secs: 30,
+            trusted_plugins: vec![],
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// Color theme
     pub theme: String,
@@ -158,5 +174,46 @@ impl Default for UiConfig {
             show_line_numbers: true,
             max_chat_history: 100,
         }
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cherrypi-config-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loads_toml_and_fills_missing_sections_with_defaults() {
+        let path = scratch("toml").join("config.toml");
+        std::fs::write(
+            &path,
+            "[provider]\nprovider_type = \"openrouter\"\nmodel = \"openrouter/free\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_file(&path).unwrap();
+        assert_eq!(cfg.provider.provider_type, "openrouter");
+        assert_eq!(cfg.provider.model, "openrouter/free");
+        assert_eq!(cfg.agent.max_turns, AgentConfig::default().max_turns);
+    }
+
+    #[test]
+    fn loads_legacy_json_when_named_json() {
+        let path = scratch("json").join("config.json");
+        std::fs::write(&path, r#"{"provider":{"provider_type":"ollama","model":"llama3.2"}}"#).unwrap();
+        let cfg = Config::load_file(&path).unwrap();
+        assert_eq!(cfg.provider.model, "llama3.2");
+    }
+
+    #[test]
+    fn reports_invalid_toml_with_the_file_name() {
+        let path = scratch("bad").join("config.toml");
+        std::fs::write(&path, "[provider\nmodel = ").unwrap();
+        let err = Config::load_file(&path).unwrap_err();
+        assert!(err.contains("config.toml"), "{err}");
     }
 }

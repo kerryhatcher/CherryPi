@@ -44,7 +44,7 @@ impl Provider for OllamaProvider {
     async fn list_models(&self) -> Result<Vec<String>, String> {
         let resp = self
             .client
-            .get(&self.tags_endpoint())
+            .get(self.tags_endpoint())
             .send()
             .await
             .map_err(|e| {
@@ -93,7 +93,7 @@ impl Provider for OllamaProvider {
 
         let resp = self
             .client
-            .post(&self.chat_endpoint())
+            .post(self.chat_endpoint())
             .json(&ollama_req)
             .send()
             .await
@@ -203,7 +203,7 @@ impl Provider for OllamaProvider {
 
             let resp = self
                 .client
-                .post(&self.chat_endpoint())
+                .post(self.chat_endpoint())
                 .json(&ollama_req)
                 .send()
                 .await

@@ -77,11 +77,11 @@ impl PluginDiscovery {
             return None;
         }
 
-        let manifest = PluginManifest::load(&plugin_dir.to_path_buf());
+        let manifest = PluginManifest::load(plugin_dir);
         let name = manifest
             .as_ref()
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| PluginManifest::name_from_dir(&plugin_dir.to_path_buf()));
+            .unwrap_or_else(|| PluginManifest::name_from_dir(plugin_dir));
 
         info!("Discovering plugin: {} at {:?}", name, plugin_dir);
 
@@ -129,7 +129,7 @@ impl PluginDiscovery {
             if let Ok(entries) = std::fs::read_dir(&commands_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "md") {
+                    if path.extension().is_some_and(|e| e == "md") {
                         let name = path.file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
@@ -154,7 +154,7 @@ impl PluginDiscovery {
             if let Some(cmd_paths) = &manifest.commands {
                 for cmd_path in cmd_paths.paths() {
                     let full_path = plugin_dir.join(cmd_path.trim_start_matches("./"));
-                    if full_path.is_file() && full_path.extension().map_or(false, |e| e == "md") {
+                    if full_path.is_file() && full_path.extension().is_some_and(|e| e == "md") {
                         let name = full_path.file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
@@ -209,7 +209,7 @@ impl PluginDiscovery {
         if components.skills.is_empty() {
             let root_skill = plugin_dir.join("SKILL.md");
             if root_skill.exists() {
-                let name = PluginManifest::name_from_dir(&plugin_dir.to_path_buf());
+                let name = PluginManifest::name_from_dir(plugin_dir);
                 let description = Self::parse_skill_description(&root_skill);
                 components.skills.push(AgentSkill {
                     name,
@@ -231,7 +231,7 @@ impl PluginDiscovery {
             if let Ok(entries) = std::fs::read_dir(&agents_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "md") {
+                    if path.extension().is_some_and(|e| e == "md") {
                         let name = path.file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
@@ -259,7 +259,7 @@ impl PluginDiscovery {
             if let Ok(entries) = std::fs::read_dir(&rules_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "mdc") {
+                    if path.extension().is_some_and(|e| e == "mdc") {
                         let name = path.file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown")
@@ -376,9 +376,9 @@ impl PluginDiscovery {
 
     fn extract_frontmatter(content: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
         let content = content.trim();
-        if content.starts_with("---") {
-            let end = content[3..].find("---")?;
-            let fm_str = &content[3..3 + end];
+        if let Some(stripped) = content.strip_prefix("---") {
+            let end = stripped.find("---")?;
+            let fm_str = &stripped[..end];
             // Try YAML first, then JSON
             serde_yaml::from_str::<serde_json::Value>(fm_str)
                 .ok()

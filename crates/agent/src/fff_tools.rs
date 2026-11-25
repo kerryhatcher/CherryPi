@@ -107,7 +107,7 @@ fn looks_like_filename(seg: &str) -> bool {
         let ext = &seg[dot_idx + 1..];
         !ext.is_empty()
             && ext.len() <= 10
-            && ext.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
+            && ext.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
             && ext.chars().all(|c| c.is_ascii_alphanumeric())
     } else {
         false
@@ -419,11 +419,11 @@ impl ToolHandler for FffGrepTool {
         let result = picker.grep(&parsed, &opts);
 
         if result.matches.is_empty() {
-            let extra = if result.regex_fallback_error.is_some() {
-                format!(" (regex fallback: {})", result.regex_fallback_error.unwrap())
-            } else {
-                String::new()
-            };
+            let extra = result
+                .regex_fallback_error
+                .as_ref()
+                .map(|error| format!(" (regex fallback: {error})"))
+                .unwrap_or_default();
             return ToolResult {
                 tool_call_id: String::new(),
                 content: format!(
