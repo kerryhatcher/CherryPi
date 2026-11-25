@@ -126,7 +126,16 @@ impl Agent {
     }
 
     pub fn set_model(&mut self, model: String) {
-        self.context.config.provider.model = model;
+        let previous = std::mem::replace(&mut self.context.config.provider.model, model.clone());
+        if previous != model {
+            info!(
+                provider = %self.context.provider.name(),
+                service = %self.context.config.provider.endpoint,
+                from = %previous,
+                to = %model,
+                "model switched"
+            );
+        }
     }
 
     /// Process a user message and return the assistant's response.
@@ -171,15 +180,61 @@ impl Agent {
 
             // Build the chat request
             let request = self.build_chat_request();
+            let provider_name = self.context.provider.name().to_string();
+            let service = self.context.config.provider.endpoint.clone();
+            let requested_model = request.model.clone();
+            info!(
+                provider = %provider_name,
+                service = %service,
+                model = %requested_model,
+                turn,
+                messages = request.messages.len() as u64,
+                tools = request.tools.as_ref().map_or(0, |t| t.len()) as u64,
+                max_tokens = request.max_tokens.unwrap_or(0) as u64,
+                temperature = request.temperature.unwrap_or(0.0) as f64,
+                "llm request"
+            );
 
             // Send to LLM
             let response = match self.context.provider.chat(request).await {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("LLM provider error on turn {}: {}", turn, e);
+                    error!(
+                        provider = %provider_name,
+                        service = %service,
+                        model = %requested_model,
+                        "LLM provider error on turn {}: {}",
+                        turn,
+                        e
+                    );
                     return Err(e);
                 }
             };
+
+            // Log what the service reports back, so a model switch can be checked
+            // against the model that actually answered.
+            let first = response.choices.first();
+            let tool_names: Vec<&str> = first
+                .and_then(|c| c.message.tool_calls.as_ref())
+                .map(|calls| calls.iter().map(|c| c.function.name.as_str()).collect())
+                .unwrap_or_default();
+            let reply_text = match first.map(|c| &c.message.content) {
+                Some(cherrypi_llm::types::MessageContent::Text(t)) => t.as_str(),
+                _ => "",
+            };
+            info!(
+                provider = %provider_name,
+                service = %service,
+                requested_model = %requested_model,
+                response_model = %response.model,
+                response_id = %response.id,
+                finish_reason = first.and_then(|c| c.finish_reason.as_deref()).unwrap_or("none"),
+                prompt_tokens = response.usage.prompt_tokens as u64,
+                completion_tokens = response.usage.completion_tokens as u64,
+                tool_calls = %tool_names.join(","),
+                content = %log_preview(reply_text, LOG_OUTPUT_MAX),
+                "llm response"
+            );
 
             // Process the response
             let choice = response
