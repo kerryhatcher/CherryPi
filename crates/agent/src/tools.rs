@@ -10,6 +10,7 @@ use fff_search::{FilePicker, FilePickerOptions, FFFMode, SharedFilePicker, Share
 use tracing::{info, warn};
 
 use crate::sandbox::Sandbox;
+use crate::web;
 
 const MAX_FILE_BYTES: u64 = 1_048_576;
 const MAX_TOOL_OUTPUT_BYTES: usize = 65_536;
@@ -127,8 +128,15 @@ impl BuiltinTools {
         if enabled("edit") { registry.register(Arc::new(EditFileTool::new(working_dir.clone()))); }
         if enabled("bash") { registry.register(Arc::new(BashTool::new(working_dir.clone(), extra_bin_paths))); }
         if enabled("ls") { registry.register(Arc::new(ListDirTool::new(working_dir.clone()))); }
-        if enabled("web_search") { registry.register(Arc::new(WebSearchTool)); }
-        if enabled("web_fetch") { registry.register(Arc::new(WebFetchTool)); }
+        if enabled("web_search") || enabled("web_fetch") {
+            match web::client() {
+                Ok(client) => {
+                    if enabled("web_search") { registry.register(Arc::new(WebSearchTool { client: client.clone() })); }
+                    if enabled("web_fetch") { registry.register(Arc::new(WebFetchTool { client })); }
+                }
+                Err(e) => warn!("Web tools disabled: {}", e),
+            }
+        }
         if enabled("git") { registry.register(Arc::new(crate::git_tool::GitTool::new(working_dir.clone()))); }
 
         match fff_picker {
@@ -793,14 +801,16 @@ impl ToolHandler for ListDirTool {
 
 // --- Web Search Tool ---
 
-struct WebSearchTool;
+struct WebSearchTool {
+    client: reqwest::Client,
+}
 
 #[async_trait]
 impl ToolHandler for WebSearchTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "web_search".into(),
-            description: "Search the web using a local Ollama web search instance.".into(),
+            description: "Search the web with the Brave Search API. Returns a JSON array of {title, url, snippet} objects.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -810,7 +820,7 @@ impl ToolHandler for WebSearchTool {
                     },
                     "max_results": {
                         "type": "number",
-                        "description": "Maximum number of results (default: 5)"
+                        "description": "Maximum number of results, 1-20 (default: 5)"
                     }
                 },
                 "required": ["query"]
@@ -819,55 +829,48 @@ impl ToolHandler for WebSearchTool {
     }
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
-        let query = arguments["query"].as_str().unwrap_or("");
-        let max_results = arguments["max_results"].as_u64().unwrap_or(5);
+        let query = arguments["query"].as_str().unwrap_or("").trim();
+        if query.is_empty() {
+            return tool_error("web_search requires a non-empty query".into());
+        }
+        let max_results = arguments["max_results"]
+            .as_f64()
+            .map(|n| n.max(1.0) as u64)
+            .unwrap_or(5);
 
-        // Use curl to call Ollama's web search API
-        let output = std::process::Command::new("curl")
-            .arg("-s")
-            .arg(format!(
-                "http://localhost:11434/api/web_search?query={}&max_results={}",
-                urlencoding(query),
-                max_results
-            ))
-            .output();
-
-        match output {
-            Ok(out) => {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    ToolResult {
-                        tool_call_id: String::new(),
-                        content: stdout.to_string(),
-                        is_error: false,
-                    }
-                } else {
-                    ToolResult {
-                        tool_call_id: String::new(),
-                        content: "Web search failed. Ensure Ollama is running with web search enabled.".into(),
-                        is_error: true,
-                    }
-                }
+        let api_key = match std::env::var(web::BRAVE_API_KEY_ENV) {
+            Ok(key) if !key.trim().is_empty() => key,
+            _ => {
+                return tool_error(format!(
+                    "web_search needs a Brave Search API key. Set {}.",
+                    web::BRAVE_API_KEY_ENV
+                ))
             }
-            Err(e) => ToolResult {
-                tool_call_id: String::new(),
-                content: format!("Web search error: {}", e),
-                is_error: true,
+        };
+
+        match web::brave_search(&self.client, api_key.trim(), query, max_results).await {
+            Ok(results) if results.is_empty() => tool_ok("No results found.".into()),
+            Ok(results) => match serde_json::to_string_pretty(&results) {
+                Ok(json) => tool_ok(json),
+                Err(e) => tool_error(format!("Failed to encode search results: {e}")),
             },
+            Err(e) => tool_error(e),
         }
     }
 }
 
 // --- Web Fetch Tool ---
 
-struct WebFetchTool;
+struct WebFetchTool {
+    client: reqwest::Client,
+}
 
 #[async_trait]
 impl ToolHandler for WebFetchTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "web_fetch".into(),
-            description: "Fetch and extract text content from a URL.".into(),
+            description: "Fetch a http(s) URL and return its text content. HTML is reduced to plain text.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -883,52 +886,30 @@ impl ToolHandler for WebFetchTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
         let url = arguments["url"].as_str().unwrap_or("");
-
-        let output = std::process::Command::new("curl")
-            .arg("-s")
-            .arg(format!(
-                "http://localhost:11434/api/web_fetch?url={}",
-                urlencoding(url)
-            ))
-            .output();
-
-        match output {
-            Ok(out) => {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    ToolResult {
-                        tool_call_id: String::new(),
-                        content: stdout.to_string(),
-                        is_error: false,
-                    }
-                } else {
-                    ToolResult {
-                        tool_call_id: String::new(),
-                        content: "Web fetch failed. Ensure Ollama is running with web fetch enabled.".into(),
-                        is_error: true,
-                    }
-                }
-            }
-            Err(e) => ToolResult {
-                tool_call_id: String::new(),
-                content: format!("Web fetch error: {}", e),
-                is_error: true,
-            },
+        match web::fetch_text(&self.client, url).await {
+            Ok(text) => tool_ok(text),
+            Err(e) => tool_error(e),
         }
     }
 }
 
-// --- Helpers ---
-
-fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => "+".to_string(),
-            _ => format!("%{:02X}", c as u8),
-        })
-        .collect()
+fn tool_ok(content: String) -> ToolResult {
+    ToolResult {
+        tool_call_id: String::new(),
+        content,
+        is_error: false,
+    }
 }
+
+fn tool_error(content: String) -> ToolResult {
+    ToolResult {
+        tool_call_id: String::new(),
+        content,
+        is_error: true,
+    }
+}
+
+// --- Helpers ---
 
 #[cfg(all(test, target_os = "linux"))]
 mod bash_secret_env_tests {
