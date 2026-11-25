@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
@@ -10,6 +11,36 @@ use cherrypi_plugins::WorkspaceInfo;
 
 use super::context::AgentContext;
 use super::tools::BuiltinTools;
+
+/// Failed calls allowed per tool within one user request before further calls
+/// to that tool are refused.
+const MAX_TOOL_FAILURES: usize = 3;
+
+/// Counts failed calls per tool within one user request. Once a tool has failed
+/// `limit` times, further calls to it are refused, so the model cannot loop on it.
+struct ToolFailureLimit {
+    failures: HashMap<String, usize>,
+    limit: usize,
+}
+
+impl ToolFailureLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            failures: HashMap::new(),
+            limit,
+        }
+    }
+
+    fn is_blocked(&self, tool: &str) -> bool {
+        self.failures.get(tool).copied().unwrap_or(0) >= self.limit
+    }
+
+    fn record(&mut self, tool: &str, is_error: bool) {
+        if is_error {
+            *self.failures.entry(tool.to_string()).or_insert(0) += 1;
+        }
+    }
+}
 
 /// Max characters of tool arguments written to the log.
 const LOG_ARGS_MAX: usize = 4000;
@@ -26,6 +57,34 @@ fn parse_tool_arguments(v: &serde_json::Value) -> serde_json::Value {
             serde_json::from_str(s).unwrap_or_else(|_| v.clone())
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tool_failure_limit_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_a_tool_after_limit_failures() {
+        let mut limit = ToolFailureLimit::new(3);
+        for _ in 0..2 {
+            limit.record("web_fetch", true);
+        }
+        assert!(!limit.is_blocked("web_fetch"));
+        limit.record("web_fetch", true);
+        assert!(limit.is_blocked("web_fetch"));
+    }
+
+    #[test]
+    fn successes_do_not_count_and_tools_are_independent() {
+        let mut limit = ToolFailureLimit::new(2);
+        for _ in 0..5 {
+            limit.record("web_search", false);
+        }
+        limit.record("web_fetch", true);
+        limit.record("web_fetch", true);
+        assert!(!limit.is_blocked("web_search"));
+        assert!(limit.is_blocked("web_fetch"));
     }
 }
 
@@ -160,6 +219,7 @@ impl Agent {
         // Run the agent loop
         let mut turn = 0;
         let max_turns = self.context.config.agent.max_turns;
+        let mut tool_failures = ToolFailureLimit::new(MAX_TOOL_FAILURES);
 
         loop {
             turn += 1;
@@ -292,7 +352,18 @@ impl Agent {
                         arguments: args,
                     };
 
-                    let result = self.context.tool_registry.execute(&tool_call).await;
+                    let result = if tool_failures.is_blocked(tool_name) {
+                        warn!(tool = %tool_name, "tool call refused: retry limit reached");
+                        Ok(cherrypi_core::tool::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: format!(
+                                "Retry limit reached: {tool_name} failed {MAX_TOOL_FAILURES} times in this request, so it was not run again. Answer with the results you already have, or explain what failed."
+                            ),
+                            is_error: true,
+                        })
+                    } else {
+                        self.context.tool_registry.execute(&tool_call).await
+                    };
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     match &result {
                         Ok(r) => info!(
@@ -351,6 +422,8 @@ impl Agent {
                             (format!("Error: {}", e), true)
                         }
                     };
+
+                    tool_failures.record(tool_name, is_error);
 
                     // Send tool call event to TUI for real-time display
                     let tc_event = ToolCallEvent {
