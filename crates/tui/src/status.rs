@@ -30,9 +30,13 @@ impl TurnState {
     }
 }
 
-/// The OSC 7501 record for `state`: `ESC ] 7501 ; state=<word> BEL`.
+/// The name herdr-core shows for this program in its `agent` field.
+const APP: &str = "cherrypi";
+
+/// The OSC 7501 record for `state`: `ESC ] 7501 ; state=<word>:app=cherrypi BEL`.
+/// The `app` key is what sets the agent label in herdr-core's listings.
 pub fn sequence(state: TurnState) -> String {
-    format!("\x1b]7501;state={}\x07", state.word())
+    format!("\x1b]7501;state={}:app={}\x07", state.word(), APP)
 }
 
 /// Write the record for `state` to `out`.
@@ -53,16 +57,16 @@ mod tests {
 
     #[test]
     fn formats_each_state_as_an_osc_7501_record() {
-        assert_eq!(sequence(TurnState::Working), "\x1b]7501;state=working\x07");
-        assert_eq!(sequence(TurnState::Done), "\x1b]7501;state=done\x07");
-        assert_eq!(sequence(TurnState::Idle), "\x1b]7501;state=idle\x07");
-        assert_eq!(sequence(TurnState::Error), "\x1b]7501;state=error\x07");
+        assert_eq!(sequence(TurnState::Working), "\x1b]7501;state=working:app=cherrypi\x07");
+        assert_eq!(sequence(TurnState::Done), "\x1b]7501;state=done:app=cherrypi\x07");
+        assert_eq!(sequence(TurnState::Idle), "\x1b]7501;state=idle:app=cherrypi\x07");
+        assert_eq!(sequence(TurnState::Error), "\x1b]7501;state=error:app=cherrypi\x07");
     }
 
     #[test]
     fn writes_the_record_to_the_output() {
         let mut out = Vec::new();
         write_state(&mut out, TurnState::Working).unwrap();
-        assert_eq!(out, b"\x1b]7501;state=working\x07");
+        assert_eq!(out, b"\x1b]7501;state=working:app=cherrypi\x07");
     }
 }
