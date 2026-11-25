@@ -303,6 +303,7 @@ dependencies = [
  "fff-search",
  "git2",
  "landlock",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
