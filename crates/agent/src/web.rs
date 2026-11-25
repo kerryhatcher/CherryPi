@@ -7,6 +7,7 @@ use std::iter::Peekable;
 use std::str::Chars;
 use std::time::Duration;
 
+use encoding_rs::{Encoding, UTF_8};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -132,15 +133,17 @@ async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Res
     if !status.is_success() {
         return Err(format!("Fetch returned {status}"));
     }
-    let is_html = resp
+    let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let is_html = content_type
+        .as_deref()
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("html"));
 
     let bytes = read_capped(&mut resp, max_bytes).await?;
-    // Assumes UTF-8; invalid bytes become U+FFFD instead of failing the fetch.
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    let body = decode_body(&bytes, content_type.as_deref(), is_html);
 
     let text = if is_html { html_to_text(&body) } else { body };
     Ok(truncate_chars(&text, FETCH_MAX_CHARS))
@@ -188,14 +191,100 @@ pub fn html_to_text(input: &str) -> String {
         }
     }
 
-    let decoded = stripped
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&");
+    let decoded = decode_entities(&stripped);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decode named and numeric (decimal or hex) character references in one
+/// pass. A decoded result is never decoded again, so `&amp;#39;` becomes
+/// `&#39;`. Unknown or malformed references are left as written.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        match parse_entity(after) {
+            Some((ch, len)) => {
+                out.push(ch);
+                rest = &after[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse one reference at the start of `s` (which begins with `&`). Returns the
+/// character and the number of bytes consumed.
+fn parse_entity(s: &str) -> Option<(char, usize)> {
+    // Entity names are short. Search only a small window, and scan bytes so a
+    // multi-byte character at the window edge cannot cause a slicing panic.
+    let bytes = s.as_bytes();
+    let end = bytes[..bytes.len().min(12)].iter().position(|&b| b == b';')?;
+    let body = &s[1..end];
+    let ch = if let Some(num) = body.strip_prefix('#') {
+        let code = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        char::from_u32(code)?
+    } else {
+        match body {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            "nbsp" => ' ',
+            _ => return None,
+        }
+    };
+    Some((ch, end + 1))
+}
+
+/// Decode a response body to text. The charset comes from the Content-Type
+/// header or, for HTML, a `<meta charset>` tag. Otherwise the body is UTF-8.
+/// Invalid sequences become U+FFFD. A byte-order mark is also respected.
+fn decode_body(bytes: &[u8], content_type: Option<&str>, is_html: bool) -> String {
+    let label = content_type
+        .and_then(charset_from_content_type)
+        .or_else(|| if is_html { charset_from_meta(bytes) } else { None });
+    let encoding = label
+        .as_deref()
+        .and_then(|l| Encoding::for_label(l.as_bytes()))
+        .unwrap_or(UTF_8);
+    encoding.decode(bytes).0.into_owned()
+}
+
+fn charset_from_content_type(ct: &str) -> Option<String> {
+    ct.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("charset") {
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            (!value.is_empty()).then(|| value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Look for `charset=` in the first 2 KiB of an HTML document, which covers
+/// `<meta charset="...">` and `<meta http-equiv="Content-Type" ...>`.
+fn charset_from_meta(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(2048)];
+    let lower = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let start = lower.find("charset=")? + "charset=".len();
+    let label: String = lower[start..]
+        .trim_start_matches(|c| c == '"' || c == '\'' || c == ' ')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!label.is_empty()).then_some(label)
 }
 
 /// Remove every `<tag ...>...</tag>` block, case-insensitively.
@@ -275,6 +364,50 @@ mod tests {
     #[test]
     fn html_to_text_keeps_literal_less_than() {
         assert_eq!(html_to_text("if a < b then &amp; done"), "if a < b then & done");
+    }
+
+    #[test]
+    fn decodes_numeric_and_named_entities() {
+        assert_eq!(html_to_text("don&#x27;t"), "don't");
+        assert_eq!(html_to_text("it&#39;s &#8217; &#X2014;"), "it's \u{2019} \u{2014}");
+        assert_eq!(html_to_text("a&amp;b &quot;q&quot; &apos;x&apos;"), "a&b \"q\" 'x'");
+    }
+
+    #[test]
+    fn entities_decode_once() {
+        assert_eq!(decode_entities("&amp;#39;"), "&#39;");
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn malformed_entities_are_left_alone() {
+        assert_eq!(decode_entities("&#xZZ; &unknown; & alone &#;"), "&#xZZ; &unknown; & alone &#;");
+        // Surrogate code points are not valid chars and must not be emitted.
+        assert_eq!(decode_entities("&#xD800;"), "&#xD800;");
+        // A multi-byte character right after '&' must not panic when slicing.
+        assert_eq!(decode_entities("&é and &ü;"), "&é and &ü;");
+    }
+
+    #[test]
+    fn decodes_body_using_header_charset() {
+        let bytes = b"caf\xe9";
+        assert_eq!(decode_body(bytes, Some("text/plain; charset=ISO-8859-1"), false), "café");
+        assert_eq!(decode_body(bytes, Some("text/plain; charset=\"windows-1252\""), false), "café");
+    }
+
+    #[test]
+    fn decodes_body_using_meta_charset_for_html() {
+        let bytes = b"<html><head><meta charset=\"iso-8859-1\"></head><body>caf\xe9</body></html>";
+        assert!(decode_body(bytes, Some("text/html"), true).contains("café"));
+        // Without HTML, meta tags are not inspected.
+        assert!(!decode_body(bytes, None, false).contains("café"));
+    }
+
+    #[test]
+    fn defaults_to_utf8() {
+        assert_eq!(decode_body("café".as_bytes(), None, false), "café");
+        // Unknown charset labels fall back to UTF-8 instead of failing.
+        assert_eq!(decode_body("café".as_bytes(), Some("text/plain; charset=bogus"), false), "café");
     }
 
     #[test]
