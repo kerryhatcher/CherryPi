@@ -870,13 +870,17 @@ impl ToolHandler for WebFetchTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "web_fetch".into(),
-            description: "Fetch a http(s) URL and return its text content. HTML is reduced to plain text.".into(),
+            description: "Fetch a http(s) URL and return its text content. By default the raw HTML is reduced to plain text. Set render to true for JavaScript-heavy pages (single-page apps), which are rendered in a browser engine first. Rendering is slower.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
                         "description": "URL to fetch and extract content from"
+                    },
+                    "render": {
+                        "type": "boolean",
+                        "description": "Render the page with JavaScript before extracting text (default: false)"
                     }
                 },
                 "required": ["url"]
@@ -886,10 +890,28 @@ impl ToolHandler for WebFetchTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
         let url = arguments["url"].as_str().unwrap_or("");
+        if arguments["render"].as_bool().unwrap_or(false) {
+            return render_fetch(url).await;
+        }
         match web::fetch_text(&self.client, url).await {
             Ok(text) => tool_ok(text),
             Err(e) => tool_error(e),
         }
+    }
+}
+
+/// Render `url` in Servo and format the title and text for the model.
+async fn render_fetch(url: &str) -> ToolResult {
+    let url = match web::validate_http_url(url).and_then(|u| url::Url::parse(u).map_err(|e| e.to_string())) {
+        Ok(url) => url,
+        Err(e) => return tool_error(e),
+    };
+    match crate::render::render_page(url, crate::render::RENDER_TIMEOUT).await {
+        Ok(page) => {
+            let text = web::truncate_chars(&page.text, web::FETCH_MAX_CHARS);
+            tool_ok(format!("Title: {}\n\n{}", page.title, text))
+        }
+        Err(e) => tool_error(format!("Render failed: {e}")),
     }
 }
 

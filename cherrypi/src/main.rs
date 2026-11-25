@@ -55,8 +55,19 @@ struct Cli {
     debug: bool,
 }
 
+/// Shuts the Servo render thread down when `main` returns, on any path. Skipping
+/// this can crash during process teardown.
+struct RenderShutdown;
+
+impl Drop for RenderShutdown {
+    fn drop(&mut self) {
+        cherrypi_agent::render::shutdown_renderer();
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _render_shutdown = RenderShutdown;
     let cli = Cli::parse();
 
     // Initialize platform-standard directories and config

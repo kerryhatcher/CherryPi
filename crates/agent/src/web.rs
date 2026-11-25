@@ -20,7 +20,8 @@ pub const BRAVE_API_KEY_ENV: &str = "BRAVE_SEARCH_API_KEY";
 const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 const BRAVE_MAX_COUNT: u64 = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const FETCH_MAX_CHARS: usize = 20_000;
+/// Maximum characters of page text returned to the model.
+pub const FETCH_MAX_CHARS: usize = 20_000;
 /// Raw response bytes read before giving up, so a huge page cannot exhaust memory.
 const FETCH_MAX_BYTES: usize = 5 * 1024 * 1024;
 
@@ -117,12 +118,19 @@ pub async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
     fetch_text_limited(client, url, FETCH_MAX_BYTES).await
 }
 
-async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Result<String, String> {
+/// Accept only absolute http and https URLs. Returns the trimmed URL.
+pub fn validate_http_url(url: &str) -> Result<&str, String> {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err("Only http:// and https:// URLs can be fetched".into());
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Ok(url)
+    } else {
+        Err("Only http:// and https:// URLs can be fetched".into())
     }
+}
+
+async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Result<String, String> {
+    let url = validate_http_url(url)?;
 
     let mut resp = client
         .get(url)

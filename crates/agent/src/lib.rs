@@ -13,6 +13,7 @@ pub mod fff_tools;
 pub mod context;
 pub mod sandbox;
 pub mod git_tool;
+pub mod render;
 pub mod web;
 
 pub use agent::Agent;
