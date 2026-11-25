@@ -34,9 +34,16 @@ const MIN_SETTLE: Duration = Duration::from_secs(1);
 /// Grace period beyond the job's timeout for the render thread to reply.
 const REPLY_SLACK: Duration = Duration::from_secs(10);
 
-/// Script run in the page to read its title and text.
-const SNAPSHOT_SCRIPT: &str =
-    "({title: document.title, text: document.body ? document.body.textContent : ''})";
+/// Script run in the page to read its title and visible text. It works on a
+/// copy of the body with script, style, and template content removed, so
+/// source code does not end up in the text.
+const SNAPSHOT_SCRIPT: &str = "(function () {\
+    var body = document.body;\
+    if (!body) { return {title: document.title, text: ''}; }\
+    var copy = body.cloneNode(true);\
+    copy.querySelectorAll('script, style, noscript, template').forEach(function (node) { node.remove(); });\
+    return {title: document.title, text: copy.textContent};\
+})()";
 
 /// A rendered page: its title and the visible text, whitespace collapsed.
 #[derive(Debug, Clone, PartialEq)]
@@ -294,6 +301,11 @@ mod tests {
         assert!(
             page.text.contains("rendered-by-javascript-marker"),
             "text was: {:?}",
+            page.text
+        );
+        assert!(
+            !page.text.contains("setTimeout"),
+            "script source leaked into text: {:?}",
             page.text
         );
         shutdown_renderer();
