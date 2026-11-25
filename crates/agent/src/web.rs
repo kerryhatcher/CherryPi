@@ -20,6 +20,8 @@ const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 const BRAVE_MAX_COUNT: u64 = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const FETCH_MAX_CHARS: usize = 20_000;
+/// Raw response bytes read before giving up, so a huge page cannot exhaust memory.
+const FETCH_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 /// One search hit, in the shape every search backend is normalized to.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -111,33 +113,54 @@ pub fn normalize_brave(body: &str) -> Result<Vec<SearchResult>, String> {
 /// Fetch an http(s) URL and return its text. HTML is reduced to plain text and
 /// the result is capped at a fixed size.
 pub async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
+    fetch_text_limited(client, url, FETCH_MAX_BYTES).await
+}
+
+async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Result<String, String> {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err("Only http:// and https:// URLs can be fetched".into());
     }
 
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
         .map_err(|e| format!("Fetch failed: {e}"))?;
     let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Fetch returned {status}"));
+    }
     let is_html = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("html"));
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("Fetch returned {status}"));
-    }
+
+    let bytes = read_capped(&mut resp, max_bytes).await?;
+    // Assumes UTF-8; invalid bytes become U+FFFD instead of failing the fetch.
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let text = if is_html { html_to_text(&body) } else { body };
     Ok(truncate_chars(&text, FETCH_MAX_CHARS))
+}
+
+/// Read the response body chunk by chunk, failing once it exceeds `max_bytes`.
+/// This does not depend on Content-Length, which a response may omit.
+async fn read_capped(resp: &mut reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))?
+    {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(format!("Response body exceeds {max_bytes} bytes; not fetched"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Reduce HTML to plain text. Drops `<script>` and `<style>` bodies and tags,
@@ -279,6 +302,26 @@ mod tests {
         for r in &results {
             println!("{} | {}", r.title, r.url);
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_stops_at_byte_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let body = "a".repeat(200);
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}");
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let client = client().unwrap();
+        let url = format!("http://{addr}/");
+        let err = fetch_text_limited(&client, &url, 50).await.unwrap_err();
+        assert!(err.contains("exceeds 50 bytes"), "{err}");
     }
 
     #[tokio::test]
