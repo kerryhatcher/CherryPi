@@ -2,7 +2,6 @@
 ///
 /// All plugin components are namespaced as `{plugin-name}:{component-name}`
 /// to prevent conflicts between plugins.
-
 /// Format a namespaced component name
 pub fn namespace(plugin_name: &str, component_name: &str) -> String {
     format!("{}:{}", plugin_name, component_name)

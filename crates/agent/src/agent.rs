@@ -11,6 +11,69 @@ use cherrypi_plugins::WorkspaceInfo;
 use super::context::AgentContext;
 use super::tools::BuiltinTools;
 
+/// Max characters of tool arguments written to the log.
+const LOG_ARGS_MAX: usize = 4000;
+/// Max characters of tool output or error text written to the log.
+const LOG_OUTPUT_MAX: usize = 2000;
+
+/// Tool arguments as the tool should receive them. OpenAI-compatible providers
+/// send `arguments` as a JSON-encoded string, so parse it into an object here.
+/// Without this, every field lookup returns null (e.g. `command` becomes "").
+/// If the string is not valid JSON it is passed through unchanged.
+fn parse_tool_arguments(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| v.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tool_argument_tests {
+    use super::*;
+
+    #[test]
+    fn json_string_arguments_are_parsed_into_an_object() {
+        let raw = serde_json::Value::String(r#"{"command":"echo hi"}"#.to_string());
+        let parsed = parse_tool_arguments(&raw);
+        assert_eq!(parsed["command"].as_str(), Some("echo hi"));
+    }
+
+    #[test]
+    fn object_arguments_pass_through_unchanged() {
+        let raw = serde_json::json!({"path": "README.md"});
+        assert_eq!(parse_tool_arguments(&raw)["path"].as_str(), Some("README.md"));
+    }
+
+    #[test]
+    fn invalid_json_string_is_kept_as_is() {
+        let raw = serde_json::Value::String("not json".to_string());
+        assert_eq!(parse_tool_arguments(&raw), raw);
+    }
+}
+
+/// Tool arguments as plain text: JSON strings are unwrapped, other values are
+/// serialized, so the log shows the arguments as sent rather than re-quoted.
+fn args_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Truncate `s` for logging at a char boundary, noting the original size.
+fn log_preview(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes total]", &s[..end], s.len())
+}
+
 /// The main agent that orchestrates the conversation loop
 pub struct Agent {
     context: AgentContext,
@@ -29,6 +92,7 @@ impl Agent {
             context.fff_picker.clone(),
             cancel_flag,
             extra_bin_paths,
+            &context.config.agent.enabled_tools,
         );
 
         // Add system message (use config override or built-in default)
@@ -51,6 +115,27 @@ impl Agent {
     /// Get a mutable reference to the agent context
     pub fn context_mut(&mut self) -> &mut AgentContext {
         &mut self.context
+    }
+
+    /// Start a fresh conversation while retaining the configured system prompt.
+    pub fn reset_conversation(&mut self) {
+        self.context.conversation = cherrypi_core::message::Conversation::new();
+        let system_prompt = self.context.config.agent.system_prompt.clone()
+            .unwrap_or_else(|| include_str!("../../core/assets/system_prompt.md").to_string());
+        self.context.conversation.add_message(Message::system(&system_prompt));
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        let previous = std::mem::replace(&mut self.context.config.provider.model, model.clone());
+        if previous != model {
+            info!(
+                provider = %self.context.provider.name(),
+                service = %self.context.config.provider.endpoint,
+                from = %previous,
+                to = %model,
+                "model switched"
+            );
+        }
     }
 
     /// Process a user message and return the assistant's response.
@@ -95,18 +180,67 @@ impl Agent {
 
             // Build the chat request
             let request = self.build_chat_request();
+            let provider_name = self.context.provider.name().to_string();
+            let service = self.context.config.provider.endpoint.clone();
+            let requested_model = request.model.clone();
+            info!(
+                provider = %provider_name,
+                service = %service,
+                model = %requested_model,
+                turn,
+                messages = request.messages.len() as u64,
+                tools = request.tools.as_ref().map_or(0, |t| t.len()) as u64,
+                max_tokens = request.max_tokens.unwrap_or(0) as u64,
+                temperature = request.temperature.unwrap_or(0.0) as f64,
+                "llm request"
+            );
 
             // Send to LLM
             let response = match self.context.provider.chat(request).await {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("LLM provider error on turn {}: {}", turn, e);
+                    error!(
+                        provider = %provider_name,
+                        service = %service,
+                        model = %requested_model,
+                        "LLM provider error on turn {}: {}",
+                        turn,
+                        e
+                    );
                     return Err(e);
                 }
             };
 
+            // Log what the service reports back, so a model switch can be checked
+            // against the model that actually answered.
+            let first = response.choices.first();
+            let tool_names: Vec<&str> = first
+                .and_then(|c| c.message.tool_calls.as_ref())
+                .map(|calls| calls.iter().map(|c| c.function.name.as_str()).collect())
+                .unwrap_or_default();
+            let reply_text = match first.map(|c| &c.message.content) {
+                Some(cherrypi_llm::types::MessageContent::Text(t)) => t.as_str(),
+                _ => "",
+            };
+            info!(
+                provider = %provider_name,
+                service = %service,
+                requested_model = %requested_model,
+                response_model = %response.model,
+                response_id = %response.id,
+                finish_reason = first.and_then(|c| c.finish_reason.as_deref()).unwrap_or("none"),
+                prompt_tokens = response.usage.prompt_tokens as u64,
+                completion_tokens = response.usage.completion_tokens as u64,
+                tool_calls = %tool_names.join(","),
+                content = %log_preview(reply_text, LOG_OUTPUT_MAX),
+                "llm response"
+            );
+
             // Process the response
-            let choice = &response.choices[0];
+            let choice = response
+                .choices
+                .first()
+                .ok_or_else(|| "Provider returned no choices".to_string())?;
             let message = &choice.message;
 
             // Check for tool calls
@@ -133,7 +267,7 @@ impl Agent {
                 // Execute each tool call
                 for tc in tool_calls {
                     let tool_name = &tc.function.name;
-                    let args = tc.function.arguments.clone();
+                    let args = parse_tool_arguments(&tc.function.arguments);
 
                     // Fire PreToolUse event
                     let event = Event::PreToolUse {
@@ -144,6 +278,14 @@ impl Agent {
                     self.context.hook_engine.fire(&event, &self.hook_context()).await;
 
                     // Execute the tool
+                    info!(
+                        tool = %tool_name,
+                        call_id = %tc.id,
+                        args = %log_preview(&args_text(&args), LOG_ARGS_MAX),
+                        "tool call started"
+                    );
+                    let started = std::time::Instant::now();
+
                     let tool_call = cherrypi_core::tool::ToolCall {
                         id: tc.id.clone(),
                         name: tool_name.clone(),
@@ -151,6 +293,25 @@ impl Agent {
                     };
 
                     let result = self.context.tool_registry.execute(&tool_call).await;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    match &result {
+                        Ok(r) => info!(
+                            tool = %tool_name,
+                            call_id = %tc.id,
+                            elapsed_ms,
+                            is_error = r.is_error,
+                            output_bytes = r.content.len() as u64,
+                            output = %log_preview(&r.content, LOG_OUTPUT_MAX),
+                            "tool call finished"
+                        ),
+                        Err(e) => info!(
+                            tool = %tool_name,
+                            call_id = %tc.id,
+                            elapsed_ms,
+                            error = %log_preview(e, LOG_OUTPUT_MAX),
+                            "tool call failed"
+                        ),
+                    }
 
                     let (output, is_error) = match result {
                         Ok(tool_result) => {
@@ -184,7 +345,7 @@ impl Agent {
                             self.context.hook_engine.fire(&event, &self.hook_context()).await;
 
                             self.context.conversation.add_message(
-                                Message::tool_result(tc.id.clone(), &format!("Error: {}", e)),
+                                Message::tool_result(tc.id.clone(), format!("Error: {}", e)),
                             );
 
                             (format!("Error: {}", e), true)
@@ -233,12 +394,34 @@ impl Agent {
 
     /// Build a chat request from the current conversation state
     fn build_chat_request(&self) -> ChatRequest {
+        // Token counting is provider-specific; four bytes per token is a
+        // conservative, deterministic approximation that prevents unbounded
+        // request growth while keeping all system instructions.
+        let budget = self.context.config.provider.max_context_tokens.saturating_mul(4);
+        let mut used = 0usize;
+        let mut recent = Vec::new();
+        for (index, message) in self.context.conversation.messages.iter().enumerate().rev() {
+            if message.role == cherrypi_core::message::MessageRole::System {
+                continue;
+            }
+            let size = message.content.text().len();
+            if used.saturating_add(size) <= budget {
+                used += size;
+                recent.push(index);
+            }
+        }
+        recent.sort_unstable();
         let messages: Vec<ChatMessage> = self
             .context
             .conversation
             .messages
             .iter()
-            .map(|msg| {
+            .enumerate()
+            .filter(|(index, message)| {
+                message.role == cherrypi_core::message::MessageRole::System
+                    || recent.binary_search(index).is_ok()
+            })
+            .map(|(_, msg)| {
                 let content = match &msg.content {
                     cherrypi_core::message::MessageContent::Text(t) => {
                         MessageContent::Text(t.clone())
@@ -316,6 +499,12 @@ impl Agent {
 
         // Discover and load all plugins
         let loaded = self.context.plugin_loader.discover_all();
+        for name in &loaded {
+            if !self.context.config.plugins.trusted_plugins.iter().any(|trusted| trusted == name) {
+                self.context.plugin_loader.disable(name);
+                warn!("Plugin '{}' discovered but not trusted; it will not execute. Add it to plugins.trusted_plugins after review.", name);
+            }
+        }
         info!("Loaded {} plugins: {:?}", loaded.len(), loaded);
 
         // Register hooks from plugins
@@ -337,6 +526,10 @@ impl Agent {
                 );
             }
         }
+
+        self.context.hook_engine.set_timeout(std::time::Duration::from_secs(
+            self.context.config.plugins.timeout_secs.clamp(1, 300),
+        ));
 
         // Start MCP servers
         self.context.mcp_manager.start_all();

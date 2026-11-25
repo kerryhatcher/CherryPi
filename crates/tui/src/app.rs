@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -33,6 +33,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo { name: "/quit",    description: "Exit CherryPi",              usage: "/quit" },
     CommandInfo { name: "/exit",    description: "Exit CherryPi",              usage: "/exit" },
     CommandInfo { name: "/clear",   description: "Clear chat history",         usage: "/clear" },
+    CommandInfo { name: "/new",     description: "Start a new conversation",  usage: "/new" },
     CommandInfo { name: "/plugins", description: "Show plugin manager",        usage: "/plugins" },
     CommandInfo { name: "/models",  description: "List available models",      usage: "/models" },
     CommandInfo { name: "/model",  description: "Switch to a different model", usage: "/model <name>" },
@@ -46,8 +47,10 @@ pub const COMMANDS: &[CommandInfo] = &[
 
 /// Application state
 pub struct App {
-    /// The agent
-    pub agent: Agent,
+    /// The agent. Shared so a turn can run on its own handle while the TUI keeps
+    /// redrawing (spinner, live tool calls). Lock only when the agent is idle or
+    /// from the processing future; never hold a guard across another lock.
+    pub agent: std::sync::Arc<std::sync::Mutex<Agent>>,
     /// Current input text
     pub input: String,
     /// Chat messages (for display)
@@ -217,7 +220,7 @@ impl App {
         let input_history = load_history(&history_file);
 
         Ok(Self {
-            agent,
+            agent: std::sync::Arc::new(std::sync::Mutex::new(agent)),
             input: String::new(),
             messages: vec![DisplayMessage {
                 role: MessageRole::System,
@@ -285,7 +288,7 @@ impl App {
         self.chat_logger.log("user", &input);
 
         // Record in input history (skip consecutive duplicates)
-        if self.input_history.last().map_or(true, |last| last != &input) {
+        if self.input_history.last() != Some(&input) {
             self.input_history.push(input.clone());
             self.save_history();
         }
@@ -428,8 +431,7 @@ impl App {
     /// Cycle to the next (newer) submitted input.
     /// Restores the draft when moving past the newest entry.
     pub fn history_next(&mut self) {
-        match self.history_index {
-            Some(i) => {
+        if let Some(i) = self.history_index {
                 if i + 1 < self.input_history.len() {
                     self.history_index = Some(i + 1);
                     self.input = self.input_history[i + 1].clone();
@@ -438,8 +440,6 @@ impl App {
                     self.history_index = None;
                     self.input = self.input_draft.clone();
                 }
-            }
-            None => {} // not browsing history
         }
     }
 
@@ -563,16 +563,28 @@ impl App {
                     is_error: false,
                 });
             }
+            "/new" => {
+                self.agent.lock().unwrap().reset_conversation();
+                self.messages.clear();
+                self.messages.push(DisplayMessage {
+                    role: MessageRole::System,
+                    content: "New conversation started.".to_string(),
+                    kind: MessageKind::Normal,
+                    timestamp: chrono::Utc::now(),
+                    is_error: false,
+                });
+                self.status_message = "Ready".to_string();
+            }
             "/plugins" => {
                 self.view_mode = ViewMode::PluginManager;
                 self.list_selection = 0;
-                self.plugin_list = self.agent.context().plugin_loader.list();
+                self.plugin_list = self.agent.lock().unwrap().context().plugin_loader.list();
             }
             "/models" => {
                 self.view_mode = ViewMode::ModelSelector;
                 self.list_selection = 0;
                 self.status_message = "Loading models...".to_string();
-                match self.agent.context().provider.list_models().await {
+                match self.agent.lock().unwrap().context().provider.list_models().await {
                     Ok(models) => {
                         self.available_models = models;
                         if let Some(pos) = self.available_models.iter().position(|m| m == &self.current_model) {
@@ -589,6 +601,7 @@ impl App {
             "/model" => {
                 if let Some(model) = parts.get(1) {
                     self.current_model = model.to_string();
+                    self.agent.lock().unwrap().set_model(self.current_model.clone());
                     self.status_message = format!("Model set to: {}", model);
                     self.messages.push(DisplayMessage {
                         role: MessageRole::System,
@@ -670,9 +683,10 @@ impl App {
                     return;
                 }
 
-                match self.agent.context_mut().plugin_loader.uninstall(plugin_name) {
+                let uninstall_result = self.agent.lock().unwrap().context_mut().plugin_loader.uninstall(plugin_name);
+                match uninstall_result {
                     Ok(_) => {
-                        self.plugin_list = self.agent.context().plugin_loader.list();
+                        self.plugin_list = self.agent.lock().unwrap().context().plugin_loader.list();
                         self.messages.push(DisplayMessage {
                             role: MessageRole::System,
                             content: format!("Plugin '{}' removed.", plugin_name),
@@ -707,7 +721,7 @@ impl App {
     }
 
     pub async fn load_models(&mut self) {
-        match self.agent.context().provider.list_models().await {
+        match self.agent.lock().unwrap().context().provider.list_models().await {
             Ok(models) => {
                 self.available_models = models;
             }
@@ -720,7 +734,7 @@ impl App {
 
     /// Show FFF file-index health: scan progress, watcher state, file count.
     async fn show_fff_health(&mut self) {
-        let picker = match self.agent.context().fff_picker.clone() {
+        let picker = match self.agent.lock().unwrap().context().fff_picker.clone() {
             Some(p) => p,
             None => {
                 self.messages.push(DisplayMessage {
@@ -789,10 +803,8 @@ impl App {
 
     /// Trigger an async FFF rescan (non-blocking).
     async fn trigger_fff_rescan(&mut self) {
-        let (picker, frecency) = (
-            self.agent.context().fff_picker.clone(),
-            self.agent.context().fff_frecency.clone(),
-        );
+        let picker = self.agent.lock().unwrap().context().fff_picker.clone();
+        let frecency = self.agent.lock().unwrap().context().fff_frecency.clone();
         match (picker, frecency) {
             (Some(picker), Some(frecency)) => {
                 match picker.trigger_full_rescan_async(&frecency) {
@@ -918,21 +930,17 @@ pub fn start_plugin_install(app: &mut App, crate_name: String) {
         // Read stdout line by line
         if let Some(stdout) = child.stdout.take() {
             use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout).lines() {
-                if let Ok(line) = line {
-                    let mut p = log.lock().unwrap();
-                    p.lines.push(line);
-                }
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let mut p = log.lock().unwrap();
+                p.lines.push(line);
             }
         }
         // Read stderr line by line (cargo outputs progress here)
         if let Some(stderr) = child.stderr.take() {
             use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr).lines() {
-                if let Ok(line) = line {
-                    let mut p = log.lock().unwrap();
-                    p.lines.push(line);
-                }
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut p = log.lock().unwrap();
+                p.lines.push(line);
             }
         }
 
@@ -1055,12 +1063,13 @@ pub fn poll_plugin_install(app: &mut App) -> bool {
 
     if progress.success {
         if let Some(ref plugin_dir) = progress.plugin_path {
-            match app.agent.context_mut().plugin_loader.install(
+            let install_result = app.agent.lock().unwrap().context_mut().plugin_loader.install(
                 &install.crate_name,
                 plugin_dir,
-            ) {
+            );
+            match install_result {
                 Ok(_) => {
-                    app.plugin_list = app.agent.context().plugin_loader.list();
+                    app.plugin_list = app.agent.lock().unwrap().context().plugin_loader.list();
                     let msg = match progress.result_message.as_deref() {
                         Some(m) => format!("{}\n  Plugin: {}/plugins/{}",
                             m, app.data_dir.display(), install.crate_name),
@@ -1105,7 +1114,7 @@ pub fn poll_plugin_install(app: &mut App) -> bool {
         // Ensure the cargo bin directory is on PATH for future bash calls
         let cargo_bin_dir = app.data_dir.join("cargo").join("bin");
         if cargo_bin_dir.is_dir() {
-            app.agent.context_mut()
+            app.agent.lock().unwrap().context_mut()
                 .extra_bin_paths
                 .lock()
                 .unwrap()
@@ -1193,7 +1202,7 @@ const SPINNER_FRAMES: &[&str] = &[
 ///
 /// Cargo stores sources at: `$CARGO_HOME/registry/src/<hash>/<crate>-<version>/`
 /// so we must scan one level deeper for the hash-named intermediate directories.
-fn find_plugin_in_registry(crate_name: &str, cargo_home: &PathBuf) -> Option<PathBuf> {
+fn find_plugin_in_registry(crate_name: &str, cargo_home: &Path) -> Option<PathBuf> {
     let registry_base = cargo_home.join("registry").join("src");
 
     let hash_dirs = std::fs::read_dir(&registry_base).ok()?;
@@ -1291,7 +1300,7 @@ fn fnv1a_64(s: &str) -> u64 {
 
 /// Build the per-cwd input-history file path: `<history_dir>/input_<hash>.json`.
 /// Keyed by the absolute working directory so each project has its own history.
-fn history_file_path(history_dir: &PathBuf, cwd: &str) -> PathBuf {
+fn history_file_path(history_dir: &Path, cwd: &str) -> PathBuf {
     let hash = fnv1a_64(cwd);
     history_dir.join(format!("input_{:016x}.json", hash))
 }

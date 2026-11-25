@@ -33,7 +33,9 @@ grep '"ERROR"' ~/.local/share/cherrypi/logs/cherrypi.jsonl | jq .
 
 ## Config
 
-Config file: `~/.config/cherrypi/config.json` (Linux). Created with defaults on first run if missing.
+Config file: `~/.config/cherrypi/config.toml` (Linux). Created with commented defaults on first run if missing.
+
+Lookup order (first existing file wins): `--config <path>`, `./.cherrypi.toml`, `./.cherrypi.json`, `~/.config/cherrypi/config.toml`, `~/.config/cherrypi/config.json`. Files ending in `.json` are read as the legacy JSON format; everything else is TOML.
 
 ## Build
 

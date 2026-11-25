@@ -28,9 +28,47 @@ pub struct CherryPiPaths {
     /// Log directory
     pub log_dir: PathBuf,
 
-    /// Main config file path
+    /// Main config file path (TOML)
     pub config_file: PathBuf,
+
+    /// Legacy JSON config path, read only when `config_file` does not exist
+    pub legacy_config_file: PathBuf,
 }
+
+/// Default user config, written on first run. TOML has no null, so optional
+/// settings are shown as comments.
+const DEFAULT_CONFIG_TOML: &str = r#"# CherryPi configuration.
+# Lookup order: --config <path>, ./.cherrypi.toml, then this file.
+
+[provider]
+# "ollama", "openai", "anthropic" or "openrouter"
+provider_type = "ollama"
+endpoint = "http://localhost:11434"
+# api_key = "..."  # openrouter also reads $OPENROUTER_API_KEY when this is unset
+model = "deepseek-v4-flash:cloud"
+max_context_tokens = 8192
+max_output_tokens = 4096
+temperature = 0.7
+
+[agent]
+max_turns = 50
+enabled_tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "git", "web_search", "web_fetch"]
+# system_prompt = "..."
+# working_dir = "/path/to/project"
+
+[plugins]
+enabled = true
+plugin_dirs = []
+timeout_secs = 30
+trusted_plugins = []
+# install_dir = "..."
+# install_bin_dir = "..."
+
+[ui]
+theme = "default"
+show_line_numbers = true
+max_chat_history = 100
+"#;
 
 impl CherryPiPaths {
     /// Create all directories and return the paths.
@@ -48,7 +86,8 @@ impl CherryPiPaths {
             plugins_dir: data_dir.join("plugins"),
             history_dir: data_dir.join("history"),
             log_dir: data_dir.join("logs"),
-            config_file: config_dir.join("config.json"),
+            config_file: config_dir.join("config.toml"),
+            legacy_config_file: config_dir.join("config.json"),
             config_dir,
             data_dir,
         };
@@ -67,49 +106,13 @@ impl CherryPiPaths {
         Ok(())
     }
 
-    /// Write the default config file if it doesn't exist
+    /// Write the default config file if no config exists (TOML or legacy JSON)
     pub fn ensure_default_config(&self) -> std::io::Result<bool> {
-        if self.config_file.exists() {
-            return Ok(false); // Already exists
+        if self.config_file.exists() || self.legacy_config_file.exists() {
+            return Ok(false); // Already configured
         }
 
-        let default_config = serde_json::json!({
-            "provider": {
-                "provider_type": "ollama",
-                "endpoint": "http://localhost:11434",
-                "api_key": null,
-                "model": "llama3.2",
-                "max_context_tokens": 8192,
-                "max_output_tokens": 4096,
-                "temperature": 0.7,
-                "extra": {}
-            },
-            "agent": {
-                "system_prompt": null,
-                "max_turns": 50,
-                "enabled_tools": [
-                    "read", "write", "edit", "bash",
-                    "grep", "find", "ls",
-                    "web_search", "web_fetch"
-                ],
-                "working_dir": null
-            },
-            "plugins": {
-                "enabled": true,
-                "plugin_dirs": [],
-                "install_dir": null,
-                "install_bin_dir": null,
-                "timeout_secs": 30
-            },
-            "ui": {
-                "theme": "default",
-                "show_line_numbers": true,
-                "max_chat_history": 100
-            }
-        });
-
-        let content = serde_json::to_string_pretty(&default_config)?;
-        std::fs::write(&self.config_file, content)?;
+        std::fs::write(&self.config_file, DEFAULT_CONFIG_TOML)?;
         Ok(true) // Created new
     }
 }

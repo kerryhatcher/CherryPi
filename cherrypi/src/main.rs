@@ -23,22 +23,22 @@ use cherrypi_tui::input;
 #[command(name = "cherrypi", version, about, long_about = None)]
 struct Cli {
     /// LLM provider type (ollama, openai, anthropic)
-    #[arg(short, long, default_value = "ollama")]
-    provider: String,
+    #[arg(short, long)]
+    provider: Option<String>,
 
     /// API endpoint URL
-    #[arg(short, long, default_value = "http://localhost:11434")]
-    endpoint: String,
+    #[arg(short, long)]
+    endpoint: Option<String>,
 
     /// API key (if required)
     #[arg(short = 'k', long)]
     api_key: Option<String>,
 
     /// Model name
-    #[arg(short, long, default_value = "llama3.2")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 
-    /// Path to config file
+    /// Path to a config file (TOML, or legacy JSON if it ends in .json)
     #[arg(short, long)]
     config: Option<String>,
 
@@ -71,17 +71,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let mut config = if let Some(config_path) = &cli.config {
-        let content = std::fs::read_to_string(config_path)?;
-        serde_json::from_str(&content)?
+        Config::load_file(std::path::Path::new(config_path)).map_err(|e| anyhow::anyhow!(e))?
     } else {
-        load_config(&paths, &cli)?
+        load_config(&paths)?
     };
 
     // Override with CLI args
-    config.provider.provider_type = cli.provider;
-    config.provider.endpoint = cli.endpoint;
-    config.provider.api_key = cli.api_key;
-    config.provider.model = cli.model;
+    if let Some(provider) = cli.provider { config.provider.provider_type = provider; }
+    if let Some(endpoint) = cli.endpoint { config.provider.endpoint = endpoint; }
+    if let Some(api_key) = cli.api_key { config.provider.api_key = Some(api_key); }
+    if let Some(model) = cli.model { config.provider.model = model; }
     if let Some(dir) = cli.working_dir {
         config.agent.working_dir = Some(dir);
     }
@@ -162,17 +161,36 @@ async fn run_app<B: Backend>(
 
             let cancel = app.cancel_flag.clone();
 
-            // Race: agent completion vs Esc keypress
-            tokio::select! {
-                result = app.agent.process_message(&user_input, Some(cancel)) => {
-                    app.finish_processing(result);
-                    continue;
-                }
-                _ = wait_for_esc() => {
-                    app.cancel_processing();
-                    continue;
+            // The turn runs on its own handle to the agent, so the TUI can keep
+            // redrawing (spinner, live tool calls) while it works. It races
+            // against Esc; the redraw ticker runs until one of them finishes.
+            let handle = app.agent.clone();
+            let mut turn = Box::pin(async move {
+                let mut agent = handle.lock().unwrap();
+                agent.process_message(&user_input, Some(cancel)).await
+            });
+            let mut esc = Box::pin(wait_for_esc());
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+
+            loop {
+                tokio::select! {
+                    result = &mut turn => {
+                        app.finish_processing(result);
+                        break;
+                    }
+                    _ = &mut esc => {
+                        app.cancel_processing();
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        app.tick_spinner();
+                        app.tick_status_bar();
+                        app.drain_tool_calls();
+                        terminal.draw(|f| ui::render(f, app))?;
+                    }
                 }
             }
+            continue;
         }
 
         // ── Idle state: normal input ──
@@ -189,6 +207,7 @@ async fn run_app<B: Backend>(
                     if key.code == KeyCode::Char('n')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        app.agent.lock().unwrap().reset_conversation();
                         app.messages.clear();
                         app.messages.push(cherrypi_tui::app::DisplayMessage {
                             role: cherrypi_core::message::MessageRole::System,
@@ -201,13 +220,11 @@ async fn run_app<B: Backend>(
                     }
 
                     let needs_async = input::handle_input(app, key);
-                    if needs_async {
-                        if app.input.trim().starts_with('/') {
-                            let input = app.input.clone();
-                            app.input.clear();
-                            app.history_index = None;
-                            app.handle_command(&input).await;
-                        }
+                    if needs_async && app.input.trim().starts_with('/') {
+                        let input = app.input.clone();
+                        app.input.clear();
+                        app.history_index = None;
+                        app.handle_command(&input).await;
                         // If start_processing was called, next loop
                         // iteration enters the processing branch
                     }
@@ -236,24 +253,21 @@ async fn wait_for_esc() {
     }
 }
 
-fn load_config(paths: &CherryPiPaths, _cli: &Cli) -> anyhow::Result<Config> {
-    // Try project-local config first
+/// Find and load the first config that exists: project-local TOML, project-local
+/// legacy JSON, user TOML, then user legacy JSON. Falls back to defaults.
+fn load_config(paths: &CherryPiPaths) -> anyhow::Result<Config> {
+    let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        let local_config = cwd.join(".cherrypi.json");
-        if local_config.exists() {
-            let content = std::fs::read_to_string(&local_config)?;
-            return Ok(serde_json::from_str(&content)?);
-        }
+        candidates.push(cwd.join(".cherrypi.toml"));
+        candidates.push(cwd.join(".cherrypi.json"));
     }
+    candidates.push(paths.config_file.clone());
+    candidates.push(paths.legacy_config_file.clone());
 
-    // Try the standard config file
-    if paths.config_file.exists() {
-        let content = std::fs::read_to_string(&paths.config_file)?;
-        return Ok(serde_json::from_str(&content)?);
+    match candidates.into_iter().find(|path| path.exists()) {
+        Some(path) => Config::load_file(&path).map_err(|e| anyhow::anyhow!(e)),
+        None => Ok(Config::default()),
     }
-
-    // Use defaults
-    Ok(Config::default())
 }
 
 /// Set up file-only logging (JSONL to disk).

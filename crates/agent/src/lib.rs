@@ -11,6 +11,8 @@ pub mod agent;
 pub mod tools;
 pub mod fff_tools;
 pub mod context;
+pub mod sandbox;
+pub mod git_tool;
 
 pub use agent::Agent;
 pub use tools::BuiltinTools;

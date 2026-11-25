@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use crate::types::*;
 
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, String>> + Send>>;
+
 /// Configuration for creating a provider
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
@@ -38,7 +40,7 @@ pub trait Provider: Send + Sync {
     fn chat_stream<'a>(
         &'a self,
         request: ChatRequest,
-    ) -> BoxFuture<'a, Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, String>> + Send>>, String>>;
+    ) -> BoxFuture<'a, Result<ChatStream, String>>;
 }
 
 /// Factory for creating provider instances
@@ -58,6 +60,21 @@ impl ProviderFactory {
             }
             "anthropic" => {
                 let provider = crate::anthropic::AnthropicProvider::new(config);
+                Ok(Arc::new(provider))
+            }
+            "openrouter" => {
+                let mut config = config;
+                // Fall back to OPENROUTER_API_KEY when no key is set in config or CLI.
+                if config.api_key.as_deref().map_or(true, str::is_empty) {
+                    config.api_key = std::env::var("OPENROUTER_API_KEY")
+                        .ok()
+                        .filter(|k| !k.is_empty());
+                }
+                let provider = crate::openai::OpenAiProvider::with_base_url(
+                    config,
+                    "openrouter",
+                    "https://openrouter.ai/api/v1",
+                );
                 Ok(Arc::new(provider))
             }
             _ => Err(format!("Unknown provider type: {}", provider_type)),

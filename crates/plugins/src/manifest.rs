@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Plugin manifest as defined by the Open Plugin Standard v1.0.0
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,7 +173,7 @@ pub const MANIFEST_PATHS: &[&str] = &[
 
 impl PluginManifest {
     /// Load a manifest from a plugin directory
-    pub fn load(plugin_dir: &PathBuf) -> Option<Self> {
+    pub fn load(plugin_dir: &Path) -> Option<Self> {
         for manifest_path in MANIFEST_PATHS {
             let full_path = plugin_dir.join(manifest_path);
             if full_path.exists() {
@@ -188,7 +188,7 @@ impl PluginManifest {
     }
 
     /// Derive plugin name from directory if no manifest
-    pub fn name_from_dir(plugin_dir: &PathBuf) -> String {
+    pub fn name_from_dir(plugin_dir: &Path) -> String {
         plugin_dir
             .file_name()
             .and_then(|n| n.to_str())

@@ -145,11 +145,11 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) 
     let available_width = inner.width.max(1) as usize;
     let virtual_line_count: usize = text.lines.iter()
         .map(|line| {
-            let w = line.width() as usize;
+            let w = line.width();
             if w == 0 {
                 1
             } else {
-                ((w + available_width - 1) / available_width).max(1)
+                w.div_ceil(available_width).max(1)
             }
         })
         .sum();

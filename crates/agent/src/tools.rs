@@ -9,6 +9,51 @@ use cherrypi_core::tool::{Tool, ToolHandler, ToolRegistry, ToolResult};
 use fff_search::{FilePicker, FilePickerOptions, FFFMode, SharedFilePicker, SharedFrecency};
 use tracing::{info, warn};
 
+use crate::sandbox::Sandbox;
+
+const MAX_FILE_BYTES: u64 = 1_048_576;
+const MAX_TOOL_OUTPUT_BYTES: usize = 65_536;
+
+/// Resolves a tool path (relative or absolute) and rejects `..` components and
+/// any path that resolves outside the workspace, including via symlinks.
+/// Agent supplied paths are untrusted input.
+fn resolve_workspace_path(working_dir: &PathBuf, path: &str) -> Result<PathBuf, String> {
+    let relative = std::path::Path::new(path);
+    if path.is_empty()
+        || relative.components().any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("path must be non-empty and must not contain '..'".into());
+    }
+
+    let root = std::fs::canonicalize(working_dir)
+        .map_err(|e| format!("cannot resolve workspace: {e}"))?;
+    let candidate = root.join(relative);
+    let existing = if candidate.exists() {
+        std::fs::canonicalize(&candidate).map_err(|e| format!("cannot resolve path: {e}"))?
+    } else {
+        // A write may create several new directories. Validate the nearest
+        // existing ancestor so an existing symlink cannot redirect creation.
+        let mut ancestor = candidate.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or("path has no parent")?;
+        }
+        std::fs::canonicalize(ancestor)
+            .map_err(|e| format!("cannot resolve parent directory: {e}"))?
+    };
+    if !existing.starts_with(&root) {
+        return Err("path escapes the configured workspace".into());
+    }
+    Ok(candidate)
+}
+
+fn truncate_output(mut output: String) -> String {
+    if output.len() > MAX_TOOL_OUTPUT_BYTES {
+        output.truncate(MAX_TOOL_OUTPUT_BYTES);
+        output.push_str("\n[truncated by CherryPi]");
+    }
+    output
+}
+
 /// Initialise the FFF file-search index for `working_dir`.
 ///
 /// Returns `(None, None)` if the working directory cannot be indexed (missing,
@@ -74,39 +119,31 @@ impl BuiltinTools {
         fff_picker: Option<SharedFilePicker>,
         cancel_flag: Arc<AtomicBool>,
         extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
+        enabled_tools: &[String],
     ) {
-        registry.register(Arc::new(ReadFileTool::new(working_dir.clone())));
-        registry.register(Arc::new(WriteFileTool::new(working_dir.clone())));
-        registry.register(Arc::new(EditFileTool::new(working_dir.clone())));
-        registry.register(Arc::new(BashTool::new(
-            working_dir.clone(),
-            extra_bin_paths,
-        )));
-        registry.register(Arc::new(ListDirTool::new(working_dir.clone())));
-        registry.register(Arc::new(WebSearchTool));
-        registry.register(Arc::new(WebFetchTool));
+        let enabled = |name: &str| enabled_tools.iter().any(|tool| tool == name);
+        if enabled("read") { registry.register(Arc::new(ReadFileTool::new(working_dir.clone()))); }
+        if enabled("write") { registry.register(Arc::new(WriteFileTool::new(working_dir.clone()))); }
+        if enabled("edit") { registry.register(Arc::new(EditFileTool::new(working_dir.clone()))); }
+        if enabled("bash") { registry.register(Arc::new(BashTool::new(working_dir.clone(), extra_bin_paths))); }
+        if enabled("ls") { registry.register(Arc::new(ListDirTool::new(working_dir.clone()))); }
+        if enabled("web_search") { registry.register(Arc::new(WebSearchTool)); }
+        if enabled("web_fetch") { registry.register(Arc::new(WebFetchTool)); }
+        if enabled("git") { registry.register(Arc::new(crate::git_tool::GitTool::new(working_dir.clone()))); }
 
         match fff_picker {
-            Some(picker) => {
+            Some(picker) if enabled("grep") || enabled("find") => {
                 use crate::fff_tools::{FffFindTool, FffGrepTool, FffMultiGrepTool};
-                registry.register(Arc::new(FffFindTool::new(
-                    picker.clone(),
-                    working_dir.clone(),
-                )));
-                registry.register(Arc::new(FffGrepTool::new(
-                    picker.clone(),
-                    working_dir.clone(),
-                    cancel_flag,
-                )));
-                registry.register(Arc::new(FffMultiGrepTool::new(
-                    picker.clone(),
-                    working_dir.clone(),
-                )));
+                if enabled("find") { registry.register(Arc::new(FffFindTool::new(picker.clone(), working_dir.clone()))); }
+                if enabled("grep") {
+                    registry.register(Arc::new(FffGrepTool::new(picker.clone(), working_dir.clone(), cancel_flag)));
+                    registry.register(Arc::new(FffMultiGrepTool::new(picker.clone(), working_dir.clone())));
+                }
             }
-            None => {
+            _ => {
                 info!("FFF picker unavailable; registering subprocess grep/find fallbacks");
-                registry.register(Arc::new(GrepTool::new(working_dir.clone())));
-                registry.register(Arc::new(FindTool::new(working_dir.clone())));
+                if enabled("grep") { registry.register(Arc::new(GrepTool::new(working_dir.clone()))); }
+                if enabled("find") { registry.register(Arc::new(FindTool::new(working_dir.clone()))); }
             }
         }
     }
@@ -156,7 +193,14 @@ impl ToolHandler for ReadFileTool {
         let offset = arguments["offset"].as_u64().map(|o| o as usize).unwrap_or(1);
         let limit = arguments["limit"].as_u64().map(|l| l as usize);
 
-        let full_path = resolve_path(&self.working_dir, path);
+        let full_path = match resolve_workspace_path(&self.working_dir, path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
+
+        if std::fs::metadata(&full_path).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(false) {
+            return ToolResult { tool_call_id: String::new(), content: "Refusing to read files larger than 1 MiB".into(), is_error: true };
+        }
 
         match std::fs::read_to_string(&full_path) {
             Ok(content) => {
@@ -219,7 +263,10 @@ impl ToolHandler for WriteFileTool {
         let path = arguments["path"].as_str().unwrap_or("");
         let content = arguments["content"].as_str().unwrap_or("");
 
-        let full_path = resolve_path(&self.working_dir, path);
+        let full_path = match resolve_workspace_path(&self.working_dir, path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
 
         // Create parent directories if needed
         if let Some(parent) = full_path.parent() {
@@ -298,7 +345,10 @@ impl ToolHandler for EditFileTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
         let path = arguments["path"].as_str().unwrap_or("");
-        let full_path = resolve_path(&self.working_dir, path);
+        let full_path = match resolve_workspace_path(&self.working_dir, path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
 
         let content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
@@ -377,6 +427,9 @@ struct BashTool {
     /// Additional directories to prepend to PATH (e.g. CherryPi's private
     /// cargo bin directory where plugin-installed binaries live).
     extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
+    /// Secret variables injected by `sops exec-env`. Removed from the child's
+    /// environment so commands cannot read or print them.
+    secret_env: Vec<String>,
 }
 
 impl BashTool {
@@ -384,6 +437,7 @@ impl BashTool {
         Self {
             working_dir,
             extra_bin_paths,
+            secret_env: crate::sandbox::sops_secret_names(),
         }
     }
 }
@@ -393,7 +447,7 @@ impl ToolHandler for BashTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "bash".into(),
-            description: "Execute a bash command. Returns stdout and stderr.".into(),
+            description: "Execute a bash command. Returns stdout and stderr. Commands run in a sandbox that can only read and write files inside the working directory.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -413,12 +467,15 @@ impl ToolHandler for BashTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
         let command = arguments["command"].as_str().unwrap_or("");
-        let _timeout = arguments["timeout"].as_u64().unwrap_or(30);
+        let timeout_secs = arguments["timeout"].as_u64().unwrap_or(30).clamp(1, 300);
 
         let mut cmd = std::process::Command::new("bash");
         cmd.arg("-c")
             .arg(command)
             .current_dir(&self.working_dir);
+        for name in &self.secret_env {
+            cmd.env_remove(name);
+        }
 
         // Prepend extra binary directories to PATH so plugin-installed
         // binaries (e.g. gor from the private cargo bin dir) are found.
@@ -436,10 +493,27 @@ impl ToolHandler for BashTool {
             }
         }
 
-        let output = cmd.output();
+        // Confine the command to the working directory. If the sandbox cannot be
+        // built or enforced, refuse to run rather than run unconfined.
+        let extra_read_dirs: Vec<PathBuf> = self
+            .extra_bin_paths
+            .as_ref()
+            .map(|dirs| dirs.lock().unwrap().clone())
+            .unwrap_or_default();
+        match Sandbox::prepare(&self.working_dir, &extra_read_dirs) {
+            Ok(sandbox) => sandbox.confine(&mut cmd),
+            Err(e) => {
+                return ToolResult { tool_call_id: String::new(), content: e, is_error: true };
+            }
+        }
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            tokio::task::spawn_blocking(move || cmd.output()),
+        ).await;
 
         match output {
-            Ok(out) => {
+            Ok(Ok(Ok(out))) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut result = String::new();
@@ -460,15 +534,17 @@ impl ToolHandler for BashTool {
 
                 ToolResult {
                     tool_call_id: String::new(),
-                    content: result,
+                    content: truncate_output(result),
                     is_error: !out.status.success(),
                 }
             }
-            Err(e) => ToolResult {
+            Ok(Ok(Err(e))) => ToolResult {
                 tool_call_id: String::new(),
                 content: format!("Error executing command: {}", e),
                 is_error: true,
             },
+            Ok(Err(e)) => ToolResult { tool_call_id: String::new(), content: format!("Command task failed: {e}"), is_error: true },
+            Err(_) => ToolResult { tool_call_id: String::new(), content: format!("Command exceeded {timeout_secs}s timeout"), is_error: true },
         }
     }
 }
@@ -522,7 +598,10 @@ impl ToolHandler for GrepTool {
         let glob = arguments["glob"].as_str();
         let ignore_case = arguments["ignore_case"].as_bool().unwrap_or(false);
 
-        let full_path = resolve_path(&self.working_dir, search_path);
+        let full_path = match resolve_workspace_path(&self.working_dir, search_path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
 
         let mut cmd = std::process::Command::new("rg");
         cmd.arg("--line-number");
@@ -604,7 +683,10 @@ impl ToolHandler for FindTool {
         let pattern = arguments["pattern"].as_str().unwrap_or("*");
         let search_path = arguments["path"].as_str().unwrap_or(".");
 
-        let full_path = resolve_path(&self.working_dir, search_path);
+        let full_path = match resolve_workspace_path(&self.working_dir, search_path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
 
         let output = std::process::Command::new("find")
             .arg(&full_path)
@@ -679,7 +761,10 @@ impl ToolHandler for ListDirTool {
         let path = arguments["path"].as_str().unwrap_or(".");
         let all = arguments["all"].as_bool().unwrap_or(false);
 
-        let full_path = resolve_path(&self.working_dir, path);
+        let full_path = match resolve_workspace_path(&self.working_dir, path) {
+            Ok(path) => path,
+            Err(e) => return ToolResult { tool_call_id: String::new(), content: e, is_error: true },
+        };
 
         let mut cmd = std::process::Command::new("ls");
         cmd.arg("-la");
@@ -835,15 +920,6 @@ impl ToolHandler for WebFetchTool {
 
 // --- Helpers ---
 
-fn resolve_path(working_dir: &PathBuf, path: &str) -> PathBuf {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        p
-    } else {
-        working_dir.join(p)
-    }
-}
-
 fn urlencoding(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -852,4 +928,27 @@ fn urlencoding(s: &str) -> String {
             _ => format!("%{:02X}", c as u8),
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bash_secret_env_tests {
+    use super::*;
+
+    #[test]
+    fn bash_child_does_not_see_secret_env() {
+        let name = "CHERRYPI_TEST_SECRET_STRIP";
+        std::env::set_var(name, "s3cret");
+        let ws = std::env::temp_dir().join(format!("cherrypi-secret-env-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let mut tool = BashTool::new(ws, None);
+        tool.secret_env = vec![name.to_string()];
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            tool.execute(serde_json::json!({"command": format!("echo \"[${{{name}:-unset}}]\"")})),
+        );
+        std::env::remove_var(name);
+
+        assert!(!result.content.contains("s3cret"), "secret leaked: {}", result.content);
+        assert!(result.content.contains("[unset]"), "{}", result.content);
+    }
 }

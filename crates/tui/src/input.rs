@@ -130,10 +130,8 @@ fn handle_plugin_manager_input(app: &mut App, key: KeyEvent) -> bool {
                 app.list_selection -= 1;
             }
         }
-        KeyCode::Down => {
-            if app.list_selection + 1 < app.plugin_list.len() {
-                app.list_selection += 1;
-            }
+        KeyCode::Down if app.list_selection + 1 < app.plugin_list.len() => {
+            app.list_selection += 1;
         }
         _ => {}
     }
@@ -158,20 +156,19 @@ fn handle_model_selector_input(app: &mut App, key: KeyEvent) -> bool {
                 app.list_selection += 1;
             }
         }
-        KeyCode::Enter => {
-            if app.list_selection < app.available_models.len() {
-                let model = app.available_models[app.list_selection].clone();
-                app.current_model = model.clone();
-                app.status_message = format!("Model set to: {}", model);
-                app.messages.push(super::app::DisplayMessage {
-                    role: cherrypi_core::message::MessageRole::System,
-                    content: format!("Switched to model: {}", model),
-                    kind: MessageKind::Normal,
-                    timestamp: chrono::Utc::now(),
-                    is_error: false,
-                });
-                app.view_mode = ViewMode::Chat;
-            }
+        KeyCode::Enter if app.list_selection < app.available_models.len() => {
+            let model = app.available_models[app.list_selection].clone();
+            app.current_model = model.clone();
+            app.agent.lock().unwrap().set_model(model.clone());
+            app.status_message = format!("Model set to: {}", model);
+            app.messages.push(super::app::DisplayMessage {
+                role: cherrypi_core::message::MessageRole::System,
+                content: format!("Switched to model: {}", model),
+                kind: MessageKind::Normal,
+                timestamp: chrono::Utc::now(),
+                is_error: false,
+            });
+            app.view_mode = ViewMode::Chat;
         }
         _ => {}
     }

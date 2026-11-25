@@ -8,17 +8,26 @@ use tracing::error;
 use super::provider::{Provider, ProviderConfig};
 use super::types::*;
 
-/// OpenAI provider implementation
+/// OpenAI-compatible provider (OpenAI itself, OpenRouter, ...)
 pub struct OpenAiProvider {
     config: ProviderConfig,
     client: Client,
+    name: &'static str,
+    base_url: String,
 }
 
 impl OpenAiProvider {
     pub fn new(config: ProviderConfig) -> Self {
+        Self::with_base_url(config, "openai", "https://api.openai.com/v1")
+    }
+
+    /// Build a provider for any OpenAI-compatible API at `base_url` (no trailing slash).
+    pub fn with_base_url(config: ProviderConfig, name: &'static str, base_url: &str) -> Self {
         Self {
             config,
             client: Client::new(),
+            name,
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 }
@@ -26,7 +35,7 @@ impl OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.name
     }
 
     fn default_model(&self) -> &str {
@@ -45,7 +54,7 @@ impl Provider for OpenAiProvider {
 
         let resp = self
             .client
-            .get("https://api.openai.com/v1/models")
+            .get(format!("{}/models", self.base_url))
             .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await
@@ -94,17 +103,32 @@ impl Provider for OpenAiProvider {
             "tool_choice": request.tool_choice,
         });
 
-        let resp = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&openai_req)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to connect to OpenAI for chat: {}", e);
-                format!("OpenAI request failed: {}", e)
-            })?;
+        // Shared upstream pools (e.g. OpenRouter free models) return 429 transiently;
+        // retry those with a short backoff before giving up.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 0;
+        let resp = loop {
+            attempt += 1;
+            let resp = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&openai_req)
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("Failed to connect to OpenAI for chat: {}", e);
+                    format!("OpenAI request failed: {}", e)
+                })?;
+
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_ATTEMPTS {
+                let wait = std::time::Duration::from_secs(2u64.pow(attempt));
+                error!("{} rate-limited (attempt {}); retrying in {:?}", self.name, attempt, wait);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            break resp;
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -113,9 +137,23 @@ impl Provider for OpenAiProvider {
             return Err(format!("OpenAI error {}: {}", status, body));
         }
 
-        let response: ChatResponse = resp
+        let mut body: serde_json::Value = resp
             .json()
             .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Tool-call replies carry `"content": null`; normalize it so ChatMessage decodes.
+        if let Some(choices) = body.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            for choice in choices {
+                if let Some(content) = choice.pointer_mut("/message/content") {
+                    if content.is_null() {
+                        *content = serde_json::Value::String(String::new());
+                    }
+                }
+            }
+        }
+
+        let response: ChatResponse = serde_json::from_value(body)
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(response)
