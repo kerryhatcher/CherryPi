@@ -11,5 +11,6 @@ pub mod app;
 pub mod ui;
 pub mod input;
 pub mod theme;
+pub mod status;
 
 pub use app::{App, DisplayMessage, MessageKind, poll_plugin_install};

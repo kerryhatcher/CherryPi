@@ -298,6 +298,7 @@ impl App {
         self.input.clear();
         self.pending_input = input.clone();
         self.is_processing = true;
+        crate::status::report(crate::status::TurnState::Working);
         self.cancel_flag.store(false, Ordering::SeqCst);
         self.status_message = "Thinking...".to_string();
         self.last_activity = Instant::now();
@@ -504,6 +505,11 @@ impl App {
         self.is_processing = false;
         self.processing_handle = None;
         self.pending_input.clear();
+        crate::status::report(match &result {
+            Ok(_) => crate::status::TurnState::Done,
+            Err(e) if e == "Cancelled" => crate::status::TurnState::Idle,
+            Err(_) => crate::status::TurnState::Error,
+        });
         match result {
             Ok(response) => {
                 self.chat_logger.log("assistant", &response);
