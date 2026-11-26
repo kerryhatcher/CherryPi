@@ -114,6 +114,8 @@ impl BuiltinTools {
     ///
     /// `extra_bin_paths` — additional directories to prepend to `$PATH`
     /// when executing bash commands (e.g. CherryPi's private cargo bin dir).
+    ///
+    /// `user_agent` — the User-Agent for the web tools and page renderer.
     pub fn register_all(
         registry: &mut ToolRegistry,
         working_dir: PathBuf,
@@ -121,7 +123,15 @@ impl BuiltinTools {
         cancel_flag: Arc<AtomicBool>,
         extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
         enabled_tools: &[String],
+        user_agent: &str,
     ) {
+        web::set_user_agent(user_agent);
+        #[cfg(feature = "render")]
+        if let Err(e) = servo_fetch::configure(servo_fetch::RendererConfig {
+            user_agent: web::user_agent().to_string(),
+        }) {
+            warn!("Page renderer keeps its earlier settings: {}", e);
+        }
         let enabled = |name: &str| enabled_tools.iter().any(|tool| tool == name);
         if enabled("read") { registry.register(Arc::new(ReadFileTool::new(working_dir.clone()))); }
         if enabled("write") { registry.register(Arc::new(WriteFileTool::new(working_dir.clone()))); }
@@ -870,13 +880,17 @@ impl ToolHandler for WebFetchTool {
     fn definition(&self) -> Tool {
         Tool {
             name: "web_fetch".into(),
-            description: "Fetch a http(s) URL and return its text content. HTML is reduced to plain text.".into(),
+            description: "Fetch a http(s) URL and return its text content. By default the raw HTML is reduced to plain text. Set render to true for JavaScript-heavy pages (single-page apps), which are rendered in a browser engine first. Rendering is slower.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
                         "description": "URL to fetch and extract content from"
+                    },
+                    "render": {
+                        "type": "boolean",
+                        "description": "Render the page with JavaScript before extracting text (default: false)"
                     }
                 },
                 "required": ["url"]
@@ -886,11 +900,50 @@ impl ToolHandler for WebFetchTool {
 
     async fn execute(&self, arguments: serde_json::Value) -> ToolResult {
         let url = arguments["url"].as_str().unwrap_or("");
+        if arguments["render"].as_bool().unwrap_or(false) {
+            return render_fetch(url).await;
+        }
         match web::fetch_text(&self.client, url).await {
             Ok(text) => tool_ok(text),
             Err(e) => tool_error(e),
         }
     }
+}
+
+/// Render `url` in Servo and format the title and text for the model.
+async fn render_fetch(url: &str) -> ToolResult {
+    let url = match web::validate_http_url(url).and_then(|u| url::Url::parse(u).map_err(|e| e.to_string())) {
+        Ok(url) => url,
+        Err(e) => return tool_error(e),
+    };
+    #[cfg(not(feature = "render"))]
+    {
+        let _ = url;
+        tool_error(
+            "Rendering is not available: this build of cherrypi was made without the \"render\" feature. Fetch without render instead."
+                .to_string(),
+        )
+    }
+    #[cfg(feature = "render")]
+    match servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await {
+        Ok(page) => tool_ok(format_rendered(
+            &page.title,
+            page.incomplete.as_deref(),
+            &page.text,
+        )),
+        Err(e) => tool_error(format!("Render failed: {e}")),
+    }
+}
+
+/// Format a rendered page for the model. The whole response, title included,
+/// is held to [`web::FETCH_MAX_CHARS`].
+#[cfg_attr(not(feature = "render"), allow(dead_code))]
+fn format_rendered(title: &str, incomplete: Option<&str>, text: &str) -> String {
+    let note = match incomplete {
+        Some(reason) => format!("Note: incomplete render: {reason}\n"),
+        None => String::new(),
+    };
+    web::truncate_chars(&format!("Title: {title}\n{note}\n{text}"), web::FETCH_MAX_CHARS)
 }
 
 fn tool_ok(content: String) -> ToolResult {
@@ -931,5 +984,21 @@ mod bash_secret_env_tests {
 
         assert!(!result.content.contains("s3cret"), "secret leaked: {}", result.content);
         assert!(result.content.contains("[unset]"), "{}", result.content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_response_is_capped_including_the_title() {
+        let short = format_rendered("Page", Some("slow"), "body");
+        assert_eq!(short, "Title: Page\nNote: incomplete render: slow\n\nbody");
+
+        let huge_title = "t".repeat(web::FETCH_MAX_CHARS * 2);
+        let capped = format_rendered(&huge_title, None, "body");
+        assert!(capped.ends_with("[truncated]"), "{}", &capped[capped.len() - 40..]);
+        assert!(capped.chars().count() <= web::FETCH_MAX_CHARS + "\n[truncated]".len());
     }
 }

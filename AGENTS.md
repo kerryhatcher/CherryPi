@@ -44,6 +44,19 @@ cargo build
 cargo run
 ```
 
+## Page rendering (servo-fetch)
+
+`web_fetch` with `render: true` renders the page in Servo through the
+`crates/servo-fetch` crate, which is also a standalone CLI for other tools.
+See `crates/servo-fetch/README.md`.
+
+```bash
+cargo run -p servo-fetch -- --json "https://example.com/"
+cargo build -p cherrypi --no-default-features   # cherrypi without Servo; render requests then return an error
+```
+
+The User-Agent comes from `user_agent` under `[agent]` in the config.
+
 ## Status Bar Plugins
 
 Plugins can contribute segments to the TUI status bar by declaring a `status_bar`

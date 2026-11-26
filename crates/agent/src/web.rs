@@ -5,14 +5,37 @@
 
 use std::iter::Peekable;
 use std::str::Chars;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use cherrypi_core::config::DEFAULT_USER_AGENT;
 use encoding_rs::{Encoding, UTF_8};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Browser-like User-Agent sent on every request.
-pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+/// The configured User-Agent, set once at startup by [`set_user_agent`].
+static USER_AGENT: OnceLock<String> = OnceLock::new();
+
+/// Set the User-Agent for every web request and the page renderer. The first
+/// call wins: the renderer reads it once when it starts, so later calls are
+/// ignored. An empty or non-header-safe value falls back to the default.
+pub fn set_user_agent(user_agent: &str) {
+    let user_agent = user_agent.trim();
+    let value = if user_agent.is_empty() {
+        DEFAULT_USER_AGENT
+    } else if reqwest::header::HeaderValue::from_str(user_agent).is_err() {
+        tracing::warn!("Ignoring invalid user_agent in config; using the default");
+        DEFAULT_USER_AGENT
+    } else {
+        user_agent
+    };
+    let _ = USER_AGENT.set(value.to_string());
+}
+
+/// The User-Agent web requests send: the configured one, else the default.
+pub fn user_agent() -> &'static str {
+    USER_AGENT.get().map(String::as_str).unwrap_or(DEFAULT_USER_AGENT)
+}
 
 /// Environment variable holding the Brave Search API key.
 pub const BRAVE_API_KEY_ENV: &str = "BRAVE_SEARCH_API_KEY";
@@ -20,7 +43,8 @@ pub const BRAVE_API_KEY_ENV: &str = "BRAVE_SEARCH_API_KEY";
 const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 const BRAVE_MAX_COUNT: u64 = 20;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const FETCH_MAX_CHARS: usize = 20_000;
+/// Maximum characters of page text returned to the model.
+pub const FETCH_MAX_CHARS: usize = 20_000;
 /// Raw response bytes read before giving up, so a huge page cannot exhaust memory.
 const FETCH_MAX_BYTES: usize = 5 * 1024 * 1024;
 
@@ -53,7 +77,7 @@ struct BraveResult {
 /// Build the shared HTTP client (browser User-Agent, request timeout).
 pub fn client() -> Result<Client, String> {
     Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent())
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
@@ -117,12 +141,19 @@ pub async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
     fetch_text_limited(client, url, FETCH_MAX_BYTES).await
 }
 
-async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Result<String, String> {
+/// Accept only absolute http and https URLs. Returns the trimmed URL.
+pub fn validate_http_url(url: &str) -> Result<&str, String> {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err("Only http:// and https:// URLs can be fetched".into());
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Ok(url)
+    } else {
+        Err("Only http:// and https:// URLs can be fetched".into())
     }
+}
+
+async fn fetch_text_limited(client: &Client, url: &str, max_bytes: usize) -> Result<String, String> {
+    let url = validate_http_url(url)?;
 
     let mut resp = client
         .get(url)

@@ -78,6 +78,11 @@ impl Default for ProviderConfig {
     }
 }
 
+/// User-Agent the web tools send when the config doesn't set one. It claims
+/// Windows on purpose: some sites hang requests from desktop Linux user agents.
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -94,6 +99,9 @@ pub struct AgentConfig {
 
     /// Working directory
     pub working_dir: Option<String>,
+
+    /// User-Agent sent by `web_search`, `web_fetch` and the page renderer
+    pub user_agent: String,
 }
 
 impl Default for AgentConfig {
@@ -112,6 +120,7 @@ impl Default for AgentConfig {
                 "web_fetch".into(),
             ],
             working_dir: None,
+            user_agent: DEFAULT_USER_AGENT.to_string(),
         }
     }
 }
@@ -198,6 +207,16 @@ mod load_tests {
         let cfg = Config::load_file(&path).unwrap();
         assert_eq!(cfg.provider.provider_type, "openrouter");
         assert_eq!(cfg.provider.model, "openrouter/free");
+        assert_eq!(cfg.agent.max_turns, AgentConfig::default().max_turns);
+        assert_eq!(cfg.agent.user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn reads_user_agent_from_agent_section() {
+        let path = scratch("ua").join("config.toml");
+        std::fs::write(&path, "[agent]\nuser_agent = \"TestBot/1.0\"\n").unwrap();
+        let cfg = Config::load_file(&path).unwrap();
+        assert_eq!(cfg.agent.user_agent, "TestBot/1.0");
         assert_eq!(cfg.agent.max_turns, AgentConfig::default().max_turns);
     }
 

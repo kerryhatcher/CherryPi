@@ -8,12 +8,17 @@ license.workspace = true
 name = "cherrypi"
 path = "src/main.rs"
 
+[features]
+default = ["render"]
+# web_fetch's render option (Servo). Build with --no-default-features to leave Servo out.
+render = ["cherrypi-agent/render"]
+
 [dependencies]
 cherrypi-core = { path = "../crates/core" }
 cherrypi-tui = { path = "../crates/tui" }
 cherrypi-llm = { path = "../crates/llm" }
 cherrypi-plugins = { path = "../crates/plugins" }
-cherrypi-agent = { path = "../crates/agent" }
+cherrypi-agent = { path = "../crates/agent", default-features = false }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
