@@ -83,3 +83,18 @@ fn rejects_an_invalid_user_agent() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid user agent"));
 }
+
+#[test]
+fn usage_errors_exit_1_and_help_exits_0() {
+    for args in [
+        &["--timeout", "nope", "http://127.0.0.1:9/"][..],
+        &["--timeout", "0", "http://127.0.0.1:9/"],
+        &[],
+    ] {
+        let output = servo_fetch().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "args {args:?}");
+    }
+    let help = servo_fetch().arg("--help").output().unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Exit status"));
+}

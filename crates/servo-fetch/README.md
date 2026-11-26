@@ -7,14 +7,14 @@ No Chrome, Chromium or V8 is involved.
 ## CLI
 
 ```sh
-cargo build --release -p servo-fetch
-servo-fetch https://example.com/
-servo-fetch --json --max-chars 20000 https://a.example/ https://b.example/
+cargo run --release -p servo-fetch -- https://example.com/
+cargo run --release -p servo-fetch -- --json --max-chars 20000 https://a.example/ https://b.example/
+cargo install --path crates/servo-fetch   # puts servo-fetch on PATH
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--timeout <secs>` | 20 | Time allowed for each page to load and settle |
+| `--timeout <secs>` | 20 | Time allowed for each page to load and settle (1–600) |
 | `--user-agent <str>` | Windows Firefox 160 | User-Agent for the page and its requests |
 | `--json` | off | One JSON object per URL (JSON Lines) instead of text |
 | `--max-chars <n>` | none | Keep at most this many characters of each page's text |
@@ -41,14 +41,16 @@ incomplete, 1 when at least one failed or the arguments were bad.
 servo_fetch::configure(servo_fetch::RendererConfig {
     user_agent: "MyTool/1.0".into(),
 })?; // optional; call before the first render
-let page = servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await?;
-servo_fetch::shutdown_renderer(); // before the process exits
+let result = servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await;
+servo_fetch::shutdown_renderer(); // before the process exits, on every path
+let page = result?;
 ```
 
 Servo runs once per process, on its own thread, so the settings apply to the
-whole process and are fixed after the first render. `render_page` must be
-called from within a Tokio runtime. Build with `default-features = false` to
-leave out the CLI's dependencies.
+whole process and are fixed after the first render. After
+`shutdown_renderer`, renders fail instead of starting Servo again.
+`render_page` must be called from within a Tokio runtime. Build with
+`default-features = false` to leave out the CLI's dependencies.
 
 ## Why the default User-Agent claims Windows
 

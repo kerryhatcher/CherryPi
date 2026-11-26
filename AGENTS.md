@@ -52,7 +52,7 @@ See `crates/servo-fetch/README.md`.
 
 ```bash
 cargo run -p servo-fetch -- --json "https://example.com/"
-cargo build --no-default-features   # cherrypi without Servo; render requests then return an error
+cargo build -p cherrypi --no-default-features   # cherrypi without Servo; render requests then return an error
 ```
 
 The User-Agent comes from `user_agent` under `[agent]` in the config.

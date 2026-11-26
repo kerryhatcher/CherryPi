@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
-use servo_fetch::{RenderedPage, RendererConfig, DEFAULT_USER_AGENT, RENDER_TIMEOUT};
+use servo_fetch::{RenderedPage, RendererConfig, DEFAULT_USER_AGENT, MAX_TIMEOUT, RENDER_TIMEOUT};
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +24,11 @@ struct Args {
     urls: Vec<String>,
 
     /// Seconds allowed for each page to load and settle
-    #[arg(long, default_value_t = RENDER_TIMEOUT.as_secs())]
+    #[arg(
+        long,
+        default_value_t = RENDER_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..=MAX_TIMEOUT.as_secs())
+    )]
     timeout: u64,
 
     /// User-Agent for the page and every request it makes
@@ -74,7 +78,19 @@ impl Drop for Shutdown {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = Args::parse();
+    // Exit status 2 means an incomplete render, so a usage error, which clap
+    // would report with 2, exits with 1. Help and version still exit 0.
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            let _ = e.print();
+            return if e.use_stderr() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
     init_logging();
     let _shutdown = Shutdown;
 

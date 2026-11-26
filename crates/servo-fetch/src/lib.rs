@@ -4,9 +4,10 @@
 //! # async fn demo() -> Result<(), servo_fetch::RenderError> {
 //! servo_fetch::configure(servo_fetch::RendererConfig::default())?; // optional
 //! let url = url::Url::parse("https://example.com/").unwrap();
-//! let page = servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await?;
+//! let result = servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await;
+//! servo_fetch::shutdown_renderer(); // before the process exits, on every path
+//! let page = result?;
 //! println!("{}\n{}", page.title, page.text);
-//! servo_fetch::shutdown_renderer(); // before the process exits
 //! # Ok(()) }
 //! ```
 //!
@@ -75,6 +76,9 @@ pub enum RenderError {
     /// or once the first render starts.
     #[error("the renderer is already configured with different settings")]
     AlreadyConfigured,
+    /// The timeout is zero or longer than [`MAX_TIMEOUT`].
+    #[error("invalid timeout: it must be between 1 second and {} seconds", MAX_TIMEOUT.as_secs())]
+    InvalidTimeout,
     /// The page could not be rendered: startup failed, the page produced no
     /// text in time, or the render thread stopped answering.
     #[error("{0}")]
@@ -110,6 +114,8 @@ fn user_agent() -> &'static str {
 
 /// Time allowed for one page to load and settle.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest timeout [`render_page`] accepts.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 /// Time allowed for one request made by the page's scripts.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -181,7 +187,15 @@ struct RenderThread {
     handle: JoinHandle<()>,
 }
 
-static RENDERER: Mutex<Option<RenderThread>> = Mutex::new(None);
+/// Where the renderer is in its once-per-process life.
+enum Lifecycle {
+    NotStarted,
+    Running(RenderThread),
+    /// [`shutdown_renderer`] was called. Servo cannot start again.
+    ShutDown,
+}
+
+static RENDERER: Mutex<Lifecycle> = Mutex::new(Lifecycle::NotStarted);
 
 /// Render `url` in Servo and return its title and text. The page is loaded
 /// fresh every call. Errors cover startup failures, a page that never produced
@@ -191,6 +205,9 @@ static RENDERER: Mutex<Option<RenderThread>> = Mutex::new(None);
 /// Must be called from within a Tokio runtime, which also carries the HTTP
 /// requests the page's scripts make.
 pub async fn render_page(url: url::Url, timeout: Duration) -> Result<RenderedPage, RenderError> {
+    if timeout.is_zero() || timeout > MAX_TIMEOUT {
+        return Err(RenderError::InvalidTimeout);
+    }
     let runtime = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || -> Result<RenderedPage, String> {
         let jobs = renderer()?;
@@ -217,8 +234,10 @@ fn renderer() -> Result<mpsc::Sender<Job>, String> {
     let mut guard = RENDERER
         .lock()
         .map_err(|_| "render state poisoned".to_string())?;
-    if let Some(thread) = guard.as_ref() {
-        return Ok(thread.jobs.clone());
+    match &*guard {
+        Lifecycle::Running(thread) => return Ok(thread.jobs.clone()),
+        Lifecycle::ShutDown => return Err("the renderer has been shut down".to_string()),
+        Lifecycle::NotStarted => {}
     }
     let (jobs, rx) = mpsc::channel::<Job>();
     let handle = thread::Builder::new()
@@ -226,16 +245,22 @@ fn renderer() -> Result<mpsc::Sender<Job>, String> {
         .spawn(move || render_thread(rx))
         .map_err(|e| format!("failed to start Servo render thread: {e}"))?;
     let sender = jobs.clone();
-    *guard = Some(RenderThread { jobs, handle });
+    *guard = Lifecycle::Running(RenderThread { jobs, handle });
     Ok(sender)
 }
 
 /// Stop the render thread and shut Servo down. Call this before the process
 /// exits: skipping it can crash during process teardown. Safe to call when
-/// rendering was never started, and calling it twice is harmless.
+/// rendering was never started, and calling it twice is harmless. Servo runs
+/// once per process, so later renders fail instead of starting it again.
 pub fn shutdown_renderer() {
-    let taken = RENDERER.lock().ok().and_then(|mut guard| guard.take());
-    if let Some(RenderThread { jobs, handle }) = taken {
+    // Mark the renderer shut down before waiting, so no render can start a
+    // second Servo while this one stops.
+    let previous = match RENDERER.lock() {
+        Ok(mut guard) => std::mem::replace(&mut *guard, Lifecycle::ShutDown),
+        Err(_) => return,
+    };
+    if let Lifecycle::Running(RenderThread { jobs, handle }) = previous {
         // Closing the channel makes the render thread leave its loop and drop Servo.
         drop(jobs);
         let _ = handle.join();
@@ -291,6 +316,9 @@ impl EventLoopWaker for NoopWaker {
 /// What the page script last reported, and how often it has reported.
 #[derive(Default)]
 struct Snapshot {
+    /// Which document the snapshot belongs to. Replies from an earlier
+    /// document's evaluation are ignored.
+    generation: u32,
     title: String,
     text: String,
     /// A script evaluation is in flight.
@@ -570,9 +598,18 @@ fn render_one(
         } else if loaded_at.is_some() {
             // A new document started loading after the last one finished, for
             // example when a bot check reloads the page. Wait for it instead.
+            // Its text, and any evaluation still running in it, belong to
+            // the old document, so start over.
             loaded_at = None;
             stable = 0;
             last_text = None;
+            last_sample = None;
+            seen_samples = 0;
+            let generation = snapshot.borrow().generation.wrapping_add(1);
+            *snapshot.borrow_mut() = Snapshot {
+                generation,
+                ..Snapshot::default()
+            };
         }
 
         // Sample as soon as the document exists, so a page that never finishes
@@ -582,9 +619,13 @@ fn render_one(
             if due && !snapshot.borrow().pending {
                 last_sample = Some(now);
                 snapshot.borrow_mut().pending = true;
+                let generation = snapshot.borrow().generation;
                 let shared = snapshot.clone();
                 webview.evaluate_javascript(SNAPSHOT_SCRIPT, move |result| {
                     let mut snap = shared.borrow_mut();
+                    if snap.generation != generation {
+                        return;
+                    }
                     snap.pending = false;
                     if let Ok(JSValue::Object(fields)) = result {
                         snap.title = string_field(&fields, "title");
@@ -856,7 +897,25 @@ mod tests {
             );
         }
 
+        let url = url::Url::parse("http://127.0.0.1:9/").unwrap();
+        for bad in [
+            Duration::ZERO,
+            MAX_TIMEOUT + Duration::from_secs(1),
+            Duration::MAX,
+        ] {
+            assert_eq!(
+                render_page(url.clone(), bad).await,
+                Err(RenderError::InvalidTimeout)
+            );
+        }
+
         shutdown_renderer();
+        shutdown_renderer();
+        let after = render_page(url, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&after, Err(RenderError::Failed(e)) if e.contains("shut down")),
+            "{after:?}"
+        );
     }
 
     #[test]
