@@ -755,16 +755,14 @@ dependencies = [
  "cherrypi-plugins",
  "chrono",
  "dirs",
- "dpi",
  "encoding_rs",
  "fff-search",
  "git2",
  "landlock",
  "reqwest",
- "rustls",
  "serde",
  "serde_json",
- "servo",
+ "servo-fetch",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -6340,6 +6338,26 @@ dependencies = [
  "uuid",
  "webdriver",
  "webrender_api",
+]
+
+[[package]]
+name = "servo-fetch"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "content-security-policy",
+ "cookie 0.18.3",
+ "dpi",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "servo",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

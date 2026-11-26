@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 cherrypi-core = { path = "../core" }
-cherrypi-agent = { path = "../agent" }
+cherrypi-agent = { path = "../agent", default-features = false }
 cherrypi-llm = { path = "../llm" }
 cherrypi-plugins = { path = "../plugins" }
 ratatui.workspace = true

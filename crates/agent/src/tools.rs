@@ -114,6 +114,8 @@ impl BuiltinTools {
     ///
     /// `extra_bin_paths` — additional directories to prepend to `$PATH`
     /// when executing bash commands (e.g. CherryPi's private cargo bin dir).
+    ///
+    /// `user_agent` — the User-Agent for the web tools and page renderer.
     pub fn register_all(
         registry: &mut ToolRegistry,
         working_dir: PathBuf,
@@ -121,7 +123,15 @@ impl BuiltinTools {
         cancel_flag: Arc<AtomicBool>,
         extra_bin_paths: Option<Arc<Mutex<Vec<PathBuf>>>>,
         enabled_tools: &[String],
+        user_agent: &str,
     ) {
+        web::set_user_agent(user_agent);
+        #[cfg(feature = "render")]
+        if let Err(e) = servo_fetch::configure(servo_fetch::RendererConfig {
+            user_agent: web::user_agent().to_string(),
+        }) {
+            warn!("Page renderer keeps its earlier settings: {}", e);
+        }
         let enabled = |name: &str| enabled_tools.iter().any(|tool| tool == name);
         if enabled("read") { registry.register(Arc::new(ReadFileTool::new(working_dir.clone()))); }
         if enabled("write") { registry.register(Arc::new(WriteFileTool::new(working_dir.clone()))); }
@@ -906,10 +916,23 @@ async fn render_fetch(url: &str) -> ToolResult {
         Ok(url) => url,
         Err(e) => return tool_error(e),
     };
-    match crate::render::render_page(url, crate::render::RENDER_TIMEOUT).await {
+    #[cfg(not(feature = "render"))]
+    {
+        let _ = url;
+        tool_error(
+            "Rendering is not available: this build of cherrypi was made without the \"render\" feature. Fetch without render instead."
+                .to_string(),
+        )
+    }
+    #[cfg(feature = "render")]
+    match servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await {
         Ok(page) => {
             let text = web::truncate_chars(&page.text, web::FETCH_MAX_CHARS);
-            tool_ok(format!("Title: {}\n\n{}", page.title, text))
+            let note = match &page.incomplete {
+                Some(reason) => format!("Note: incomplete render: {reason}\n"),
+                None => String::new(),
+            };
+            tool_ok(format!("Title: {}\n{note}\n{text}", page.title))
         }
         Err(e) => tool_error(format!("Render failed: {e}")),
     }

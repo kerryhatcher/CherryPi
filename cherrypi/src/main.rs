@@ -61,7 +61,7 @@ struct RenderShutdown;
 
 impl Drop for RenderShutdown {
     fn drop(&mut self) {
-        cherrypi_agent::render::shutdown_renderer();
+        cherrypi_agent::shutdown_renderer();
     }
 }
 

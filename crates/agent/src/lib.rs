@@ -13,9 +13,15 @@ pub mod fff_tools;
 pub mod context;
 pub mod sandbox;
 pub mod git_tool;
-pub mod render;
 pub mod web;
 
 pub use agent::Agent;
 pub use tools::BuiltinTools;
 pub use context::AgentContext;
+
+/// Stop the page renderer, if one was started. Call it before the process
+/// exits: skipping it can crash during process teardown.
+pub fn shutdown_renderer() {
+    #[cfg(feature = "render")]
+    servo_fetch::shutdown_renderer();
+}

@@ -152,6 +152,7 @@ impl Agent {
             cancel_flag,
             extra_bin_paths,
             &context.config.agent.enabled_tools,
+            &context.config.agent.user_agent,
         );
 
         // Add system message (use config override or built-in default)

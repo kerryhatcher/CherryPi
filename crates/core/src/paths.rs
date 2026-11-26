@@ -55,6 +55,9 @@ max_turns = 50
 enabled_tools = ["read", "write", "edit", "bash", "grep", "find", "ls", "git", "web_search", "web_fetch"]
 # system_prompt = "..."
 # working_dir = "/path/to/project"
+# User-Agent for web_search, web_fetch and the page renderer. Some sites hang
+# requests from desktop Linux user agents, hence the Windows default.
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0"
 
 [plugins]
 enabled = true
