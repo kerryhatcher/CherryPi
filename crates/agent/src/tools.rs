@@ -926,16 +926,24 @@ async fn render_fetch(url: &str) -> ToolResult {
     }
     #[cfg(feature = "render")]
     match servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await {
-        Ok(page) => {
-            let text = web::truncate_chars(&page.text, web::FETCH_MAX_CHARS);
-            let note = match &page.incomplete {
-                Some(reason) => format!("Note: incomplete render: {reason}\n"),
-                None => String::new(),
-            };
-            tool_ok(format!("Title: {}\n{note}\n{text}", page.title))
-        }
+        Ok(page) => tool_ok(format_rendered(
+            &page.title,
+            page.incomplete.as_deref(),
+            &page.text,
+        )),
         Err(e) => tool_error(format!("Render failed: {e}")),
     }
+}
+
+/// Format a rendered page for the model. The whole response, title included,
+/// is held to [`web::FETCH_MAX_CHARS`].
+#[cfg_attr(not(feature = "render"), allow(dead_code))]
+fn format_rendered(title: &str, incomplete: Option<&str>, text: &str) -> String {
+    let note = match incomplete {
+        Some(reason) => format!("Note: incomplete render: {reason}\n"),
+        None => String::new(),
+    };
+    web::truncate_chars(&format!("Title: {title}\n{note}\n{text}"), web::FETCH_MAX_CHARS)
 }
 
 fn tool_ok(content: String) -> ToolResult {
@@ -976,5 +984,21 @@ mod bash_secret_env_tests {
 
         assert!(!result.content.contains("s3cret"), "secret leaked: {}", result.content);
         assert!(result.content.contains("[unset]"), "{}", result.content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_response_is_capped_including_the_title() {
+        let short = format_rendered("Page", Some("slow"), "body");
+        assert_eq!(short, "Title: Page\nNote: incomplete render: slow\n\nbody");
+
+        let huge_title = "t".repeat(web::FETCH_MAX_CHARS * 2);
+        let capped = format_rendered(&huge_title, None, "body");
+        assert!(capped.ends_with("[truncated]"), "{}", &capped[capped.len() - 40..]);
+        assert!(capped.chars().count() <= web::FETCH_MAX_CHARS + "\n[truncated]".len());
     }
 }

@@ -354,6 +354,8 @@ impl App {
             }
             self.cancel_flag.store(true, Ordering::SeqCst);
             self.is_processing = false;
+            // The turn's future is dropped, so finish_processing never reports.
+            crate::status::report(crate::status::TurnState::Idle);
             self.status_message = "Cancelled".to_string();
             self.messages.push(DisplayMessage {
                 role: MessageRole::System,
