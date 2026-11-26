@@ -41,7 +41,7 @@ Owner's decisions:
 - No Cargo feature flag. Servo is an ordinary dependency of `cherrypi-agent`.
 
 My calls (marked as such so they can be reviewed):
-- **Module:** `crates/agent/src/render.rs` (since moved to the `crates/servo-fetch` crate, which also provides a CLI). It owns one OS thread that creates a single `Servo` instance on first use, then renders one page at a time from a job queue.
+- **Module:** `crates/agent/src/render.rs` (since moved to the `crates/servo-fetch` crate, and then to its own repo as the `cherrypi-fetch` crate, https://github.com/kerryhatcher/CherryPi-Fetch, which also provides a CLI). It owns one OS thread that creates a single `Servo` instance on first use, then renders one page at a time from a job queue.
 - **Calling pattern:** the async tool hands a job to that thread through `spawn_blocking` and waits with a deadline. The thread never blocks the Tokio runtime.
 - **Rendering:** a fresh `WebView` per request, sized 1280x1024, using `SoftwareRenderingContext` (no window or GPU needed). The `WebView` is dropped when the job finishes.
 - **Waiting for the page:** spin the Servo event loop until `LoadStatus::Complete`, then poll `document.body.textContent` every 200 ms. The page counts as settled when the text is unchanged for three samples in a row, and at least one second has passed since load completed. Stop at the job's deadline either way and return whatever text is there.

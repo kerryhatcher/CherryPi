@@ -23,5 +23,5 @@ pub use context::AgentContext;
 /// exits: skipping it can crash during process teardown.
 pub fn shutdown_renderer() {
     #[cfg(feature = "render")]
-    servo_fetch::shutdown_renderer();
+    cherrypi_fetch::shutdown_renderer();
 }

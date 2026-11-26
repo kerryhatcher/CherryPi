@@ -751,6 +751,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cherrypi-core",
+ "cherrypi-fetch",
  "cherrypi-llm",
  "cherrypi-plugins",
  "chrono",
@@ -762,7 +763,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "servo-fetch",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -782,6 +782,24 @@ dependencies = [
  "thiserror 2.0.19",
  "toml 0.8.23",
  "uuid",
+]
+
+[[package]]
+name = "cherrypi-fetch"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed73cd8a731f8d301b6f3b0ae3d328a43b61ba198144773deaf94fd124e89457"
+dependencies = [
+ "content-security-policy",
+ "cookie 0.18.3",
+ "dpi",
+ "reqwest",
+ "rustls",
+ "servo",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5393,6 +5411,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5400,6 +5419,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -5409,6 +5429,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6338,26 +6359,6 @@ dependencies = [
  "uuid",
  "webdriver",
  "webrender_api",
-]
-
-[[package]]
-name = "servo-fetch"
-version = "0.1.0"
-dependencies = [
- "clap",
- "content-security-policy",
- "cookie 0.18.3",
- "dpi",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "servo",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
