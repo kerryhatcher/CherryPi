@@ -127,7 +127,7 @@ impl BuiltinTools {
     ) {
         web::set_user_agent(user_agent);
         #[cfg(feature = "render")]
-        if let Err(e) = servo_fetch::configure(servo_fetch::RendererConfig {
+        if let Err(e) = cherrypi_fetch::configure(cherrypi_fetch::RendererConfig {
             user_agent: web::user_agent().to_string(),
         }) {
             warn!("Page renderer keeps its earlier settings: {}", e);
@@ -925,7 +925,7 @@ async fn render_fetch(url: &str) -> ToolResult {
         )
     }
     #[cfg(feature = "render")]
-    match servo_fetch::render_page(url, servo_fetch::RENDER_TIMEOUT).await {
+    match cherrypi_fetch::render_page(url, cherrypi_fetch::RENDER_TIMEOUT).await {
         Ok(page) => tool_ok(format_rendered(
             &page.title,
             page.incomplete.as_deref(),

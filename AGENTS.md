@@ -44,14 +44,17 @@ cargo build
 cargo run
 ```
 
-## Page rendering (servo-fetch)
+## Page rendering (cherrypi-fetch)
 
 `web_fetch` with `render: true` renders the page in Servo through the
-`crates/servo-fetch` crate, which is also a standalone CLI for other tools.
-See `crates/servo-fetch/README.md`.
+[`cherrypi-fetch`](https://crates.io/crates/cherrypi-fetch) crate from crates.io.
+Its source and CLI live in
+<https://github.com/kerryhatcher/CherryPi-Fetch>; fix renderer bugs there and
+bump the version here.
 
 ```bash
-cargo run -p servo-fetch -- --json "https://example.com/"
+cargo install cherrypi-fetch                    # the standalone CLI
+cherrypi-fetch --json "https://example.com/"
 cargo build -p cherrypi --no-default-features   # cherrypi without Servo; render requests then return an error
 ```
 

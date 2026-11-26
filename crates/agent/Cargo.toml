@@ -6,9 +6,9 @@ license.workspace = true
 
 [features]
 default = ["render"]
-# web_fetch's render option, which renders pages in Servo via servo-fetch.
+# web_fetch's render option, which renders pages in Servo via the cherrypi-fetch crate.
 # Without it cherrypi builds without Servo and render requests return an error.
-render = ["dep:servo-fetch"]
+render = ["dep:cherrypi-fetch"]
 
 [dependencies]
 cherrypi-core = { path = "../core" }
@@ -18,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 encoding_rs = "0.8"
-servo-fetch = { path = "../servo-fetch", default-features = false, optional = true }
+cherrypi-fetch = { version = "0.1", default-features = false, optional = true }
 url = "2"
 thiserror.workspace = true
 anyhow.workspace = true

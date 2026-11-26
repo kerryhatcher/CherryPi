@@ -189,7 +189,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -751,6 +751,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cherrypi-core",
+ "cherrypi-fetch",
  "cherrypi-llm",
  "cherrypi-plugins",
  "chrono",
@@ -762,7 +763,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "servo-fetch",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -782,6 +782,24 @@ dependencies = [
  "thiserror 2.0.19",
  "toml 0.8.23",
  "uuid",
+]
+
+[[package]]
+name = "cherrypi-fetch"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff7e65b7b520ea723ad4bbb28e997abdc65d077be1fa568c5de254dae2b680e6"
+dependencies = [
+ "content-security-policy",
+ "cookie 0.18.3",
+ "dpi",
+ "reqwest",
+ "rustls",
+ "servo",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1713,7 +1731,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2639,6 +2657,7 @@ dependencies = [
  "hyper-util",
  "log",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -4259,7 +4278,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4666,7 +4685,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5393,6 +5412,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5400,6 +5421,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -5580,7 +5602,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5637,7 +5659,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6338,26 +6360,6 @@ dependencies = [
  "uuid",
  "webdriver",
  "webrender_api",
-]
-
-[[package]]
-name = "servo-fetch"
-version = "0.1.0"
-dependencies = [
- "clap",
- "content-security-policy",
- "cookie 0.18.3",
- "dpi",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "servo",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -8063,7 +8065,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9335,7 +9337,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
