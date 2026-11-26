@@ -48,7 +48,7 @@ cargo run
 
 `web_fetch` with `render: true` renders the page in Servo through the
 [`cherrypi-fetch`](https://crates.io/crates/cherrypi-fetch) crate from crates.io.
-Its source, CLI and agent plugins live in
+Its source and CLI live in
 <https://github.com/kerryhatcher/CherryPi-Fetch>; fix renderer bugs there and
 bump the version here.
 
